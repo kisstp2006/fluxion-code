@@ -115,6 +115,10 @@ pub fn draw(v: View, ed: *Document, ui: *Ui, focused: bool) void {
     });
     defer ui.close();
     ed.gutter = gutterWidth(ed);
+    // Its rows and marks float over it, and fluxion-ui takes the pointer's
+    // shape from what it is over, which stops at a float: the view says
+    // its own wherever the pointer is on it.
+    if (v.under(ui)) ui.setCursor(shapeAt(ed, ui.pointer.position.x));
     var line = ed.top;
     const last = @min(ed.buffer.lineCount(), ed.top + ed.rows + 1);
     while (line < last) : (line += 1) v.row(ed, ui, line);
@@ -599,6 +603,14 @@ pub fn under(v: View, ui: *Ui) bool {
     return ui.isPointerWithin(v.ids.code) and !v.overList(ui);
 }
 
+/// The pointer's shape at `x` on the view: an arrow on the line numbers and
+/// the scrollbar, the text's caret on the text.
+fn shapeAt(ed: *const Document, x: f32) ui_lib.CursorShape {
+    const x0, _, const w, _ = ed.view;
+    if (x < x0 + ed.gutter or x >= x0 + w - 12) return .arrow;
+    return .ibeam;
+}
+
 /// Whether the pointer is on the list of completions or the doc beside it,
 /// which answer it themselves.
 fn overList(v: View, ui: *Ui) bool {
@@ -793,6 +805,12 @@ test "the view is under the pointer on its words and on its tooltip, and a press
     _ = try frame(view, &ed, &ui, &ruler);
     try testing.expect(!ui.isPointerOver(view.ids.code));
     try testing.expect(view.under(&ui));
+    // And the pointer is the text's caret there, on the line the caret is
+    // on - lit across - as on any other; an arrow on the line numbers.
+    try testing.expectEqual(ui_lib.CursorShape.ibeam, ui.cursor());
+    ui.setPointer(2, 8, false);
+    _ = try frame(view, &ed, &ui, &ruler);
+    try testing.expectEqual(ui_lib.CursorShape.arrow, ui.cursor());
 
     // A tooltip under the first line, over the second: the view is under
     // the pointer there too, and a press goes to the text beneath it.
