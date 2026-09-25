@@ -65,7 +65,9 @@ version: u64 = 0,
 saved: u64 = 0,
 
 const State = struct { text: []u8, cursor: u32, anchor: u32 };
-const Change = enum { none, typing, deleting, other };
+/// What a change is, for the undo: changes of one kind in a row are one
+/// step, but for `other`.
+pub const Change = enum { none, typing, deleting, other, picking };
 const max_undo = 400;
 
 pub fn init(gpa: Allocator, text: []const u8, rules: Rules) Allocator.Error!Buffer {

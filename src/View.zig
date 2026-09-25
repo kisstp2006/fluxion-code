@@ -16,6 +16,7 @@ const ui_lib = @import("fluxion_ui");
 const Document = @import("Document.zig");
 const Theme = @import("Theme.zig");
 const search = @import("search.zig");
+const colors = @import("colors.zig");
 
 const Ui = ui_lib.Ui;
 const Color = ui_lib.Color;
@@ -34,6 +35,9 @@ font: u16 = 0,
 /// And for prose: the docs under completions, signatures and hovers, and
 /// the find bar.
 prose_font: u16 = 0,
+/// The minimap's texture, as a number in the table the interface's renderer
+/// was given - the host makes it from `minimapPixels` - or null for none.
+minimap_texture: ?u32 = null,
 
 pub const Ids = struct {
     code: []const u8 = "code",
@@ -41,6 +45,10 @@ pub const Ids = struct {
     completion_doc: []const u8 = "code-completion-doc",
     signature: []const u8 = "code-signature",
     hover: []const u8 = "code-hover",
+    /// The colour picker a swatch opens; its parts are named after it.
+    picker: []const u8 = "code-picker",
+    /// The button after the path the caret is in, which has another chosen.
+    choose: []const u8 = "code-choose",
     /// The find bar; its fields and buttons are named after it.
     find: []const u8 = "code-find",
 };
@@ -115,6 +123,8 @@ pub fn draw(v: View, ed: *Document, ui: *Ui, focused: bool) void {
     });
     defer ui.close();
     ed.gutter = gutterWidth(ed);
+    // The minimap, when there is one and room for it, and the scrollbar.
+    ed.aside = if (v.minimap_texture != null and ed.view[2] >= 3 * minimap_columns) minimap_columns + 12 else 12;
     // Its rows and marks float over it, and fluxion-ui takes the pointer's
     // shape from what it is over, which stops at a float: the view says
     // its own wherever the pointer is on it.
@@ -128,9 +138,193 @@ pub fn draw(v: View, ed: *Document, ui: *Ui, focused: bool) void {
     v.mistakes(ed, ui);
     if (focused and @mod(ed.now - ed.typed_at, 1.0) < 0.6) v.caret(ed, ui);
     scrollbar(ed, ui);
+    v.minimap(ed, ui);
     v.completion(ed, ui);
     v.signature(ed, ui);
     v.hover(ed, ui);
+    v.picker(ed, ui);
+    v.chooser(ed, ui);
+}
+
+/// A button after the path the caret is in, which asks the host to have
+/// another chosen.
+fn chooser(v: View, ed: *Document, ui: *Ui) void {
+    const b = &ed.buffer;
+    const at = ed.pathAt(b.cursor) orelse return;
+    const line = b.lineOf(at[1]);
+    if (!inView(ed, line)) return;
+    if (ui.isElementReleased(v.ids.choose)) ed.choosing = at;
+    const after = @min(at[1] + 1, b.lineEnd(line));
+    ui.open(.{
+        .id = v.ids.choose,
+        .height = .fixed(ed.metrics.line_height),
+        .padding = .xy(4, 0),
+        .align_y = .center,
+        .corner_radius = .all(3),
+        .border = .all(v.theme.border, 1),
+        .background_color = if (ui.isPointerOver(v.ids.choose)) v.theme.hover else v.theme.popup,
+        .floating = .{ .offset = .{ .x = xOf(ed, after) + 4, .y = yOf(ed, line) }, .z_index = 19 },
+    });
+    ui.text("...", v.style(ed, v.theme.ink));
+    ui.close();
+}
+
+// ---------------------------------------------------------------------------
+// The minimap
+
+/// How many characters of a line the minimap shows, a pixel each, and how
+/// many pixels tall it can be: a line is two while they fit.
+pub const minimap_columns = 96;
+pub const minimap_most_rows = 4096;
+
+/// The minimap: the code in its colours, a pixel a character and two a
+/// line, into `out` as RGBA rows - if the text changed since the host last
+/// made it, with its size; null when what the host has is the text's.
+pub fn minimapPixels(v: View, ed: *Document, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) std.mem.Allocator.Error!?[2]u32 {
+    ed.refresh();
+    if (ed.minimap_of == ed.buffer.version and ed.minimap_size[1] > 0) return null;
+    const b = &ed.buffer;
+    const text = b.text.items;
+    const lines = b.lineCount();
+    const width: u32 = minimap_columns;
+    const height: u32 = @min(lines * 2, minimap_most_rows);
+    try out.resize(gpa, @as(usize, width) * height * 4);
+    @memset(out.items, 0);
+    const tab: u32 = @max(ed.metrics.tab_width, 1);
+    var t: usize = 0;
+    var line: u32 = 0;
+    while (line < lines) : (line += 1) {
+        const y: usize = @intCast(@as(u64, line) * height / lines);
+        const end = b.lineEnd(line);
+        var at = b.lineStart(line);
+        var column: u32 = 0;
+        while (at < end and column < width) : (at += 1) {
+            const c = text[at];
+            if (c & 0xC0 == 0x80) continue;
+            if (c == '\t') {
+                column = (column / tab + 1) * tab;
+                continue;
+            }
+            if (c != ' ') {
+                while (t < ed.tokens.len and ed.tokens[t].start + ed.tokens[t].len <= at) t += 1;
+                const color = if (t < ed.tokens.len and ed.tokens[t].start <= at) v.theme.style(ed.tokens[t].style) else v.theme.ink;
+                const i = (y * width + column) * 4;
+                out.items[i..][0..4].* = .{ byte(color.r), byte(color.g), byte(color.b), 200 };
+            }
+            column += 1;
+        }
+    }
+    ed.minimap_of = b.version;
+    ed.minimap_size = .{ width, height };
+    return ed.minimap_size;
+}
+
+fn byte(v: f32) u8 {
+    return @intFromFloat(@round(std.math.clamp(v, 0, 1) * 255));
+}
+
+/// How far down the minimap is scrolled, in its pixels: as far through what
+/// does not fit as the view is through the lines.
+fn minimapOffset(ed: *const Document) f32 {
+    const tall: f32 = @floatFromInt(ed.minimap_size[1]);
+    const h = @max(ed.view[3], 1);
+    const total = ed.buffer.lineCount();
+    if (tall <= h or total <= ed.rows) return 0;
+    const progress = @min(1, @as(f32, @floatFromInt(ed.top)) / @as(f32, @floatFromInt(total - ed.rows)));
+    return progress * (tall - h);
+}
+
+/// The minimap beside the scrollbar, and the lines in view lit on it.
+fn minimap(v: View, ed: *Document, ui: *Ui) void {
+    const texture = v.minimap_texture orelse return;
+    if (ed.aside <= 12 or ed.minimap_size[1] == 0) return;
+    const w: f32 = @floatFromInt(ed.minimap_size[0]);
+    const tall: f32 = @floatFromInt(ed.minimap_size[1]);
+    const shown = @min(tall, @max(ed.view[3], 1));
+    const offset = minimapOffset(ed);
+    const x = ed.view[2] - ed.aside;
+    rect(ui, x, 0, w, @max(ed.view[3], 1), v.theme.code, 7);
+    ui.empty(.{
+        .width = .fixed(w),
+        .height = .fixed(shown),
+        .image = .{ .texture = texture, .source = .init(0, offset / tall, 1, shown / tall) },
+        .floating = .{ .offset = .{ .x = x, .y = 0 }, .z_index = 7, .clip = true },
+    });
+    const lines: f32 = @floatFromInt(ed.buffer.lineCount());
+    const top: f32 = @floatFromInt(ed.top);
+    const rows: f32 = @floatFromInt(ed.rows);
+    const color: Color = if (ed.drag == .minimap) .bytes(160, 160, 160, 60) else .bytes(128, 128, 128, 40);
+    rect(ui, x, top * tall / lines - offset, w, @max(4, @min(rows, lines) * tall / lines), color, 8);
+}
+
+/// The view scrolled to the line at `y` on the minimap, as it was scrolled
+/// when it was pressed: that line in the middle.
+fn scrollToMinimap(ed: *Document, y: f32) void {
+    const tall: f32 = @floatFromInt(@max(ed.minimap_size[1], 1));
+    const total = ed.buffer.lineCount();
+    const at = std.math.clamp((y + ed.minimap_from) / tall, 0, 1);
+    const line: u32 = @intFromFloat(at * @as(f32, @floatFromInt(total)));
+    ed.top = @min(line -| ed.rows / 2, total -| ed.rows);
+}
+
+/// Where the swatch of the colour from `start` is on the view, from its
+/// top left: x, y, and its side.
+fn swatchBox(ed: *const Document, start: u32) [3]f32 {
+    const line = ed.buffer.lineOf(start);
+    return .{ xOf(ed, start) - ed.swatchWidth(), yOf(ed, line), ed.swatchWidth() };
+}
+
+/// The colour picker a swatch opened, under the swatch, with a button for
+/// each way the language writes a colour.
+fn picker(v: View, ed: *Document, ui: *Ui) void {
+    const p = if (ed.picking) |*p| p else return;
+    const at = ed.colorAt(p.start) orelse return;
+    const line = ed.buffer.lineOf(p.start);
+    if (!inView(ed, line)) return;
+    const box = swatchBox(ed, p.start);
+    ui.open(.{
+        .id = v.ids.picker,
+        .direction = .top_to_bottom,
+        .padding = .all(8),
+        .gap = 8,
+        .background_color = v.theme.popup,
+        .border = .all(v.theme.border, 1),
+        .corner_radius = .all(4),
+        .capture = true,
+        .floating = .{ .offset = .{ .x = @max(0, box[0]), .y = box[1] + ed.metrics.line_height + 2 }, .z_index = 24 },
+    });
+    defer ui.close();
+    const look: ui_lib.ColorPicker.Style = .{
+        .text = v.theme.ink,
+        .dim = v.theme.dim,
+        .field = v.theme.code,
+        .border = v.theme.border,
+        .accent = v.theme.accent,
+    };
+    if (ui_lib.ColorPicker.picker(ui, &p.state, .{ .id = v.ids.picker, .size = 160, .style = look })) {
+        _ = ed.setColor(p.start, p.state.color(), null) catch {};
+    }
+    // The ways to write it: the one it is in lit.
+    ui.open(.{ .direction = .left_to_right, .gap = 4 });
+    defer ui.close();
+    for (ed.language.colors, 0..) |form, i| {
+        var name: [96]u8 = undefined;
+        const id = std.fmt.bufPrint(&name, "{s}-form-{d}", .{ v.ids.picker, i }) catch v.ids.picker;
+        var scratch: [128]u8 = undefined;
+        const can = colors.write(&scratch, form, p.state.color(), "") != null;
+        if (can and ui.isElementReleased(id)) _ = ed.setColor(p.start, p.state.color(), @intCast(i)) catch {};
+        var label_buffer: [48]u8 = undefined;
+        const lit = at.form == i;
+        ui.open(.{
+            .id = id,
+            .padding = .xy(6, 2),
+            .corner_radius = .all(3),
+            .border = .all(v.theme.border, 1),
+            .background_color = if (lit) v.theme.popup_selected else if (can and ui.isPointerOver(id)) v.theme.hover else .transparent,
+        });
+        ui.text(form.label(&label_buffer), v.style(ed, if (can) v.theme.ink else v.theme.faint));
+        ui.close();
+    }
 }
 
 fn row(v: View, ed: *Document, ui: *Ui, line: u32) void {
@@ -151,6 +345,7 @@ fn row(v: View, ed: *Document, ui: *Ui, line: u32) void {
     const end = b.lineEnd(line);
     var at = start;
     var t = ed.firstToken(start);
+    var c = ed.firstColor(start);
     while (at < end) {
         var until = end;
         var color = v.theme.ink;
@@ -161,10 +356,26 @@ fn row(v: View, ed: *Document, ui: *Ui, line: u32) void {
                 color = v.theme.style(token.style);
             } else until = @min(end, token.start);
         }
+        // A colour's swatch before it, taking room in the line.
+        while (c < ed.colors.len and ed.colors[c].start <= at) : (c += 1) {
+            if (ed.colors[c].start == at) v.swatch(ed, ui, ed.colors[c].color);
+        }
+        if (c < ed.colors.len and ed.colors[c].start < until) until = ed.colors[c].start;
         if (until > at) v.textRun(ed, ui, start, at, until, color);
         at = @max(until, at + 1);
         while (t < ed.tokens.len and ed.tokens[t].start + ed.tokens[t].len <= at) t += 1;
     }
+}
+
+/// The square of a colour in front of it, over grey so its alpha shows.
+fn swatch(v: View, ed: *const Document, ui: *Ui, c: Color) void {
+    const w = ed.swatchWidth();
+    const side = @round(ed.metrics.line_height * 0.6);
+    ui.open(.{ .width = .fixed(w), .height = .fixed(ed.metrics.line_height), .align_x = .center, .align_y = .center });
+    ui.open(.{ .width = .fixed(side), .height = .fixed(side), .padding = .all(1), .background_color = .hex(0x808080), .border = .all(v.theme.border, 1) });
+    ui.empty(.{ .width = .grow, .height = .grow, .background_color = c });
+    ui.close();
+    ui.close();
 }
 
 /// `text[from..until]` of the line starting at `line_start`, in `color`: a
@@ -341,8 +552,13 @@ fn completion(v: View, ed: *Document, ui: *Ui) void {
             .corner_radius = .all(3),
             .background_color = if (i == c.selected) v.theme.popup_selected else if (ui.isPointerOver(row_id)) v.theme.hover else .transparent,
         });
-        const letter, const color = v.theme.kind(item.kind);
-        ui.text(letter, v.style(ed, color));
+        if (item.swatch) |rgba| {
+            const side = @round(m.line_height * 0.6);
+            ui.empty(.{ .width = .fixed(side), .height = .fixed(side), .background_color = .rgba(rgba[0], rgba[1], rgba[2], rgba[3]), .border = .all(v.theme.border, 1) });
+        } else {
+            const letter, const color = v.theme.kind(item.kind);
+            ui.text(letter, v.style(ed, color));
+        }
         ui.text(item.label, v.style(ed, v.theme.ink));
         ui.open(.{ .width = .grow, .height = .fixed(m.line_height), .clip = .x, .padding = .trbl(0, 0, 0, @intFromFloat(em(ed))) });
         if (item.detail.len > 0 and item.detail[0] != ' ') ui.text(item.detail, v.style(ed, v.theme.dim));
@@ -603,18 +819,33 @@ pub fn under(v: View, ui: *Ui) bool {
     return ui.isPointerWithin(v.ids.code) and !v.overList(ui);
 }
 
+/// The colour whose swatch is at (`x`, `y`) of the view, by where it starts.
+fn swatchUnder(ed: *const Document, x: f32, y: f32) ?u32 {
+    const row_at: i64 = @intFromFloat(@floor(y / ed.metrics.line_height));
+    if (row_at < 0) return null;
+    const line = ed.top + @as(u32, @intCast(row_at));
+    if (line >= ed.buffer.lineCount()) return null;
+    const start = ed.buffer.lineStart(line);
+    var i = ed.firstColor(start);
+    while (i < ed.colors.len and ed.colors[i].start <= ed.buffer.lineEnd(line)) : (i += 1) {
+        const box = swatchBox(ed, ed.colors[i].start);
+        if (x >= box[0] and x < box[0] + box[2]) return ed.colors[i].start;
+    }
+    return null;
+}
+
 /// The pointer's shape at `x` on the view: an arrow on the line numbers and
 /// the scrollbar, the text's caret on the text.
 fn shapeAt(ed: *const Document, x: f32) ui_lib.CursorShape {
     const x0, _, const w, _ = ed.view;
-    if (x < x0 + ed.gutter or x >= x0 + w - 12) return .arrow;
+    if (x < x0 + ed.gutter or x >= x0 + w - @max(12, ed.aside)) return .arrow;
     return .ibeam;
 }
 
 /// Whether the pointer is on the list of completions or the doc beside it,
 /// which answer it themselves.
 fn overList(v: View, ui: *Ui) bool {
-    return ui.isPointerWithin(v.ids.completion) or ui.isPointerWithin(v.ids.completion_doc);
+    return ui.isPointerWithin(v.ids.completion) or ui.isPointerWithin(v.ids.completion_doc) or ui.isPointerWithin(v.ids.picker) or ui.isPointerWithin(v.ids.choose);
 }
 
 pub const Pointer = struct {
@@ -646,6 +877,7 @@ pub fn pointer(v: View, ed: *Document, ui: *Ui, p: Pointer) void {
             ed.top = @min(@as(u32, @intFromFloat(fraction * @as(f32, @floatFromInt(total)))), total -| ed.rows);
             return;
         },
+        .minimap => return scrollToMinimap(ed, p.y - y0),
         .none => {},
     }
     if (!inside) {
@@ -653,10 +885,20 @@ pub fn pointer(v: View, ed: *Document, ui: *Ui, p: Pointer) void {
         return;
     }
     if (p.pressed) {
+        // A colour's swatch opens its picker, and leaves the caret.
+        if (swatchUnder(ed, p.x - x0, p.y - y0)) |start| {
+            ed.pickColor(start);
+            return;
+        }
         ed.closePopups();
         if (p.x >= x0 + w - 12 and ed.buffer.lineCount() > ed.rows) {
             ed.drag = .scrollbar;
             return;
+        }
+        if (ed.aside > 12 and p.x >= x0 + w - ed.aside) {
+            ed.drag = .minimap;
+            ed.minimap_from = minimapOffset(ed);
+            return scrollToMinimap(ed, p.y - y0);
         }
         const at = ed.offsetAt(x0, y0, gutter, p.x, p.y);
         if (p.mods.ctrl) return ed.goToDefinition(at);
@@ -853,4 +1095,144 @@ test "the find bar goes over the code, and the places it finds are lit" {
         lit += 1;
     };
     try testing.expectEqual(@as(usize, 2), lit);
+}
+
+test "a colour's swatch is before it, a press on it opens the picker, and the picker's buttons write it in another form" {
+    const gpa = testing.allocator;
+    const forms = [_]colors.Form{
+        .{ .channels = .{ .call = "color" } },
+        .{ .hex = .{ .call = "color" } },
+    };
+    var lang = languages.plain;
+    lang.colors = &forms;
+    var ed: Document = try .init(gpa, "t.txt", "tint = color(1, 0, 0)\n", lang, .{ .font_size = 16, .line_height = 16 });
+    defer ed.deinit();
+    ed.refresh();
+    var ui: Ui = .init(gpa);
+    defer ui.deinit();
+    ui.setMeasurer(.monospace(0.5, 1.0));
+    var ruler: Ruler = .{};
+    const view: View = .{};
+    _ = try frame(view, &ed, &ui, &ruler);
+    const drawn = try frame(view, &ed, &ui, &ruler);
+
+    // The colour's text after its swatch.
+    const run = runOn(drawn, &ed, 0, "color(1, 0, 0)") orelse return error.TestExpectedEqual;
+    try testing.expectEqual(gutterWidth(&ed) + 7 * 8 + ed.swatchWidth(), run.bounding_box.x);
+    var swatches: usize = 0;
+    for (drawn) |c| if (c.config == .rectangle and std.meta.eql(c.config.rectangle.color, Color.rgba(1, 0, 0, 1))) {
+        swatches += 1;
+    };
+    try testing.expectEqual(@as(usize, 1), swatches);
+
+    // A press on the swatch: the picker, and the caret where it was.
+    const box = swatchBox(&ed, 7);
+    const x = ed.view[0] + box[0] + box[2] / 2;
+    const y = ed.view[1] + box[1] + ed.metrics.line_height / 2;
+    ui.setPointer(x, y, true);
+    _ = try frame(view, &ed, &ui, &ruler);
+    view.pointer(&ed, &ui, .{ .x = x, .y = y, .down = true, .pressed = true, .mods = .{} });
+    try testing.expect(ed.picking != null);
+    try testing.expectEqual(@as(u32, 0), ed.buffer.cursor);
+    ui.setPointer(x, y, false);
+    _ = try frame(view, &ed, &ui, &ruler);
+    _ = try frame(view, &ed, &ui, &ruler);
+    try testing.expect(ui.boxOf(view.ids.picker) != null);
+
+    // On the picker the view is not under the pointer, and its second
+    // form's button writes the colour so.
+    const form_button = ui.boxOf("code-picker-form-1") orelse return error.TestExpectedEqual;
+    const bx = form_button.x + form_button.width / 2;
+    const by = form_button.y + form_button.height / 2;
+    ui.setPointer(bx, by, false);
+    _ = try frame(view, &ed, &ui, &ruler);
+    try testing.expect(!view.under(&ui));
+    ui.setPointer(bx, by, true);
+    _ = try frame(view, &ed, &ui, &ruler);
+    ui.setPointer(bx, by, false);
+    _ = try frame(view, &ed, &ui, &ruler);
+    try testing.expectEqualStrings("tint = color(\"#FF0000\")\n", ed.buffer.text.items);
+    try testing.expect(ed.picking != null);
+
+    // Escape shuts it.
+    try testing.expect(ed.cancel());
+    try testing.expect(ed.picking == null);
+}
+
+test "the minimap is the code a pixel a character, drawn beside the scrollbar, and a press on it scrolls" {
+    const gpa = testing.allocator;
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(gpa);
+    try text.appendSlice(gpa, "ab c\n\td\n");
+    for (0..200) |_| try text.appendSlice(gpa, "line\n");
+    var ed: Document = try .init(gpa, "t.txt", text.items, languages.plain, .{ .font_size = 16, .line_height = 16 });
+    defer ed.deinit();
+    var pixels: std.ArrayList(u8) = .empty;
+    defer pixels.deinit(gpa);
+    const view: View = .{ .minimap_texture = 5 };
+    const size = (try view.minimapPixels(&ed, gpa, &pixels)) orelse return error.TestExpectedEqual;
+    try testing.expectEqual([2]u32{ minimap_columns, 203 * 2 }, size);
+    const ink = [4]u8{ byte(Theme.dark.ink.r), byte(Theme.dark.ink.g), byte(Theme.dark.ink.b), 200 };
+    const at = struct {
+        fn at(p: []const u8, x: usize, y: usize) [4]u8 {
+            return p[(y * minimap_columns + x) * 4 ..][0..4].*;
+        }
+    }.at;
+    try testing.expectEqual(ink, at(pixels.items, 0, 0));
+    try testing.expectEqual([4]u8{ 0, 0, 0, 0 }, at(pixels.items, 2, 0));
+    try testing.expectEqual(ink, at(pixels.items, 3, 0));
+    try testing.expectEqual([4]u8{ 0, 0, 0, 0 }, at(pixels.items, 0, 1));
+    // A tab reaches the next stop.
+    try testing.expectEqual(ink, at(pixels.items, 4, 2));
+    // Made again only for a new text.
+    try testing.expect((try view.minimapPixels(&ed, gpa, &pixels)) == null);
+
+    var ui: Ui = .init(gpa);
+    defer ui.deinit();
+    ui.setMeasurer(.monospace(0.5, 1.0));
+    var ruler: Ruler = .{};
+    _ = try frame(view, &ed, &ui, &ruler);
+    const drawn = try frame(view, &ed, &ui, &ruler);
+    var images: usize = 0;
+    for (drawn) |c| if (c.config == .image and c.config.image.texture == 5) {
+        images += 1;
+        try testing.expectEqual(ed.view[2] - ed.aside, c.bounding_box.x);
+    };
+    try testing.expectEqual(@as(usize, 1), images);
+    // Its lines past the view's middle: a press there scrolls down.
+    const x = ed.view[0] + ed.view[2] - ed.aside + 10;
+    const y = ed.view[1] + 300;
+    try testing.expectEqual(ui_lib.CursorShape.arrow, shapeAt(&ed, x));
+    view.pointer(&ed, &ui, .{ .x = x, .y = y, .down = true, .pressed = true, .mods = .{} });
+    try testing.expect(ed.top > 0);
+    try testing.expectEqual(@as(u32, 0), ed.buffer.cursor);
+}
+
+test "a button after the path the caret is in asks for another" {
+    const gpa = testing.allocator;
+    var lang = languages.json;
+    lang.paths = .{ .schemes = &.{"res://"} };
+    var ed: Document = try .init(gpa, "t.json", "{\"a\": \"res://x.png\"}", lang, .{ .font_size = 16, .line_height = 16 });
+    defer ed.deinit();
+    ed.refresh();
+    var ui: Ui = .init(gpa);
+    defer ui.deinit();
+    ui.setMeasurer(.monospace(0.5, 1.0));
+    var ruler: Ruler = .{};
+    const view: View = .{};
+    _ = try frame(view, &ed, &ui, &ruler);
+    try testing.expect(ui.boxOf(view.ids.choose) == null);
+    ed.buffer.moveTo(10, false);
+    _ = try frame(view, &ed, &ui, &ruler);
+    const box = ui.boxOf(view.ids.choose) orelse return error.TestExpectedEqual;
+    const bx = box.x + box.width / 2;
+    const by = box.y + box.height / 2;
+    ui.setPointer(bx, by, false);
+    _ = try frame(view, &ed, &ui, &ruler);
+    try testing.expect(!view.under(&ui));
+    ui.setPointer(bx, by, true);
+    _ = try frame(view, &ed, &ui, &ruler);
+    ui.setPointer(bx, by, false);
+    _ = try frame(view, &ed, &ui, &ruler);
+    try testing.expectEqual([2]u32{ 7, 18 }, ed.takeChoice().?);
 }

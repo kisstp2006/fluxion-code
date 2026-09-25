@@ -18,6 +18,7 @@ Plain text, Markdown and JSON come with it. A program adds its own languages and
 | `Theme` | The view's colours, and one for each `Style` a token can have. |
 | `languages` | `plain`, `markdown` and `json`. |
 | `search` | Finding words: the next place either way round, whole words, matching case, replacing them all. |
+| `colors` | The ways a language writes a colour, finding the colours a text writes, and writing one back in any of those ways. |
 
 ## A language
 
@@ -55,6 +56,37 @@ const shading: code.Language = .{
 
 `analyze` hands back an `Analysis`: its problems, its outline, and its colours - or none, for the lexis to colour it. What it keeps of the text for `hover` and `definition` it puts in `state`, and `forget` lets go of it. A language that comes with the editor gets more by copying it: `var json = code.languages.json; json.service = ...`.
 
+### Colours
+
+A language says how it writes a colour, and the view puts a swatch before each one it finds - not in a comment, and not in a string but its own. A press on the swatch opens fluxion-ui's `ColorPicker` under it: dragging it rewrites the colour where it is written, all of it one step to undo, and a button for each of the language's ways turns the colour into that one. A way that cannot write the colour - a name, for most colours - is greyed; while it is dragged, a named colour is written the first way that can.
+
+```zig
+const names = [_]code.colors.Name{ .{ .name = "red", .rgb = 0xFF0000 }, .{ .name = "royalblue", .rgb = 0x4169E1 } };
+lang.colors = &.{
+    .{ .channels = .{ .call = "color" } },                        // color(0.2, 0.4, 0.8[, 1.0])
+    .{ .hex = .{ .call = "color" } },                              // color("#3366CC")
+    .{ .hsv = .{ .call = "hsv" } },                                // hsv(220, 0.75, 0.8)
+    .{ .named = .{ .call = "color", .names = &names } },           // color("royalblue")
+    .{ .channels = .{ .call = "vec4", .least = 4, .unit_only = true } }, // a shader's vec4(1.0, 0.5, 0.0, 1.0)
+    .{ .hex = .{} },                                               // "#3366CC", as JSON has it
+};
+```
+
+A completion item with a `swatch` shows the colour in place of its kind's letter: a colour's name, offered.
+
+### Paths
+
+A host that knows its files gives a language `paths`. A string that starts with one of its `schemes` is a path: typing it offers what is in the folder it has got to, from `list` - a folder accepted, what is in it next - and ctrl and a click, or F12, asks for its file to be opened, as an `OpenRequest` of kind `named`. While the caret is in one, a button after it asks for another to be chosen: `takeChoice` hands the host where the path is, and `setPath` puts the one chosen there.
+
+```zig
+lang.paths = .{ .schemes = &.{ "res://", "user://" }, .context = project, .list = listFolder };
+
+if (doc.takeChoice()) |at| {
+    const chosen = try askForAFile(); // the host's own dialog
+    try doc.setPath(at[0], chosen);
+}
+```
+
 ## A document and its view
 
 ```zig
@@ -76,6 +108,13 @@ view.draw(&doc, &ui, true);
 view.measure(&doc, &ui, 1);
 ```
 
+**The minimap** is the code a pixel a character and two a line, in its colours, beside the scrollbar. The host makes a texture of it - `minimapPixels` hands back RGBA rows when the text changed since, with their size, and null when they are the text's - and gives the view its number in the renderer's table; a press or a drag on it scrolls there. With no texture, or no room, there is none.
+
+```zig
+if (try view.minimapPixels(&doc, gpa, &pixels)) |size| upload(texture, size, pixels.items);
+view.minimap_texture = texture_number;
+```
+
 `view.under(&ui)` says whether the pointer is on the view - its words, the rows and marks it lays over itself, a tooltip - rather than on the list of completions or on something else over it: where a press takes the keyboard and the wheel scrolls. The rows float, so fluxion-ui's `isPointerOver` of the view is false on them; ask `under`. A tooltip and a signature let the pointer through to the text beneath.
 
 The text is kept as the file has it: its tabs stay tabs, drawn to the next stop, and `written` gives the text back with the file's own line breaks, `\r\n` or `\n`. `modified` says whether it changed since `markSaved`.
@@ -89,10 +128,10 @@ The text is kept as the file has it: its tabs stay tabs, drawn to the next stop,
 | Ctrl+Z, Ctrl+Y, Ctrl+Shift+Z | Undo, redo |
 | Ctrl+/ | Comment the lines picked, or uncomment them |
 | Ctrl+Space | Completions |
-| F12, Ctrl+click | Go to the declaration |
+| F12, Ctrl+click | Go to the declaration, or open the file a path names |
 | Ctrl+F, Ctrl+H, Ctrl+G | Find, replace, go to a line |
 | F3, Shift+F3 | The next place, the one before |
-| Escape | Close the lists over the code, then the find bar |
+| Escape | Close the lists and the colour picker over the code, then the find bar |
 
 ## In a program that has fluxion-ui already
 

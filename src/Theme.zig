@@ -130,5 +130,7 @@ pub fn kind(t: *const Theme, k: language.ItemKind) struct { []const u8, Color } 
         .keyword => .{ "k", t.style(.keyword) },
         .annotation => .{ "@", t.style(.annotation) },
         .value => .{ "\"", t.style(.string) },
+        .file => .{ "F", t.style(.string) },
+        .folder => .{ "/", t.accent },
     };
 }

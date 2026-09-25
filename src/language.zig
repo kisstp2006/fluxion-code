@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const colors = @import("colors.zig");
 
 pub const Error = error{OutOfMemory};
 
@@ -99,6 +100,9 @@ pub const ItemKind = enum {
     annotation,
     /// A value a host offers inside quotes: an action's name, a path.
     value,
+    /// A file or a folder, in a path.
+    file,
+    folder,
 };
 
 /// What accepting a completion does besides putting in its name.
@@ -120,6 +124,8 @@ pub const Item = struct {
     /// Offered first when lower.
     rank: u8 = 0,
     call: Call = .none,
+    /// A colour to show in place of its kind: a colour's name, offered.
+    swatch: ?[4]f32 = null,
 };
 
 pub const Completions = struct {
@@ -231,6 +237,18 @@ pub const Lexis = struct {
     tokens: ?*const fn (arena: Allocator, text: []const u8) Error![]const Token = null,
 };
 
+/// What a host knows of the files a text names. A string that starts with
+/// one of `schemes` - `"res://art/hero.png"` - is a path: typing it offers
+/// what is in its folder, ctrl and a click asks for its file to be opened,
+/// and a button after it asks for another to be chosen.
+pub const Paths = struct {
+    schemes: []const []const u8 = &.{},
+    context: ?*anyopaque = null,
+    /// What is in `folder` - `"res://art/"` - as `.file` and `.folder`
+    /// items, a folder's name ending in `/`.
+    list: ?*const fn (context: ?*anyopaque, arena: Allocator, folder: []const u8) Error![]const Item = null,
+};
+
 pub const Language = struct {
     /// Its name, as a program shows it: "Flux", "JSON".
     name: []const u8,
@@ -244,6 +262,10 @@ pub const Language = struct {
     indent: Indent = .{ .spaces = 4 },
     /// A line ending in one of these is followed by one more level.
     indent_after: []const u8 = "",
+    /// The ways it writes a colour, which the view puts a swatch before and
+    /// a picker behind: see `colors`.
+    colors: []const colors.Form = &.{},
+    paths: Paths = .{},
     service: Service = .{},
 
     /// What an opening character closes with, or null.

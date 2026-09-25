@@ -20,6 +20,7 @@ pub const language = @import("language.zig");
 pub const lexis = @import("lexis.zig");
 pub const languages = @import("languages.zig");
 pub const search = @import("search.zig");
+pub const colors = @import("colors.zig");
 pub const Buffer = @import("Buffer.zig");
 pub const Document = @import("Document.zig");
 pub const View = @import("View.zig");
@@ -57,6 +58,7 @@ test {
     _ = lexis;
     _ = languages;
     _ = search;
+    _ = colors;
     _ = Buffer;
     _ = Document;
     _ = View;

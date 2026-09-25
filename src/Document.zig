@@ -18,6 +18,9 @@ const language_zig = @import("language.zig");
 const lexis = @import("lexis.zig");
 const search = @import("search.zig");
 const Buffer = @import("Buffer.zig");
+const colors_mod = @import("colors.zig");
+const ColorPicker = @import("fluxion_ui").ColorPicker;
+const Color = @import("fluxion_ui").Color;
 
 const Language = language_zig.Language;
 const Item = language_zig.Item;
@@ -60,6 +63,9 @@ pub const Completion = struct {
     first: usize = 0,
     /// Where the word being completed starts.
     start: u32 = 0,
+    /// What is in a path's folder: its names have dots and spaces in them,
+    /// and end at a `/`.
+    path: bool = false,
     arena: std.heap.ArenaAllocator,
 };
 
@@ -85,11 +91,15 @@ pub const Find = struct {
     focus: bool = false,
 };
 
-/// A file another hook asked to open: a declaration somewhere else.
+/// A file another hook asked to open: a declaration somewhere else, or the
+/// file a path in the text names.
 pub const OpenRequest = struct {
     path: []u8,
     start: u32,
     end: u32,
+    /// `named`: a path in a string named it, to be opened for what it is -
+    /// a picture, a scene - and not as code at a place.
+    kind: enum { declaration, named } = .declaration,
 };
 
 gpa: Allocator,
@@ -108,6 +118,18 @@ info: std.heap.ArenaAllocator,
 tokens: []const language_zig.Token = &.{},
 problems: []const language_zig.Problem = &.{},
 symbols: []const language_zig.Symbol = &.{},
+/// The colours written in it, in order, in the language's forms.
+colors: []const colors_mod.Found = &.{},
+/// The colour whose picker is open: where it is written, and the picker.
+picking: ?Picking = null,
+/// The path whose button was pressed, for the host to have another chosen:
+/// where its text is, inside the quotes. See `takeChoice`.
+choosing: ?[2]u32 = null,
+/// The buffer's version the host's minimap is of, and its size in pixels;
+/// see `View.minimapPixels`. A host drawing several documents' minimaps
+/// from one texture sets it to 0 when it shows another.
+minimap_of: u64 = 0,
+minimap_size: [2]u32 = .{ 0, 0 },
 
 /// The first line in view, and how far the view is scrolled sideways, in
 /// pixels: a character is not a column when the font is not monospaced.
@@ -134,7 +156,13 @@ typed_at: f64 = 0,
 view: [4]f32 = .{ 0, 0, 0, 0 },
 /// How wide the line numbers were, from the view.
 gutter: f32 = 0,
-drag: enum { none, text, scrollbar } = .none,
+/// How wide what lies over the view's right side is - the minimap and the
+/// scrollbar - which the caret is kept out from under.
+aside: f32 = 0,
+drag: enum { none, text, scrollbar, minimap } = .none,
+/// How far the minimap was scrolled when it was pressed: it stays so while
+/// it is dragged, so that a place on it stays a line.
+minimap_from: f32 = 0,
 last_click: f64 = -1,
 clicks: u8 = 0,
 click_offset: u32 = 0,
@@ -245,6 +273,7 @@ pub fn refresh(ed: *Document) void {
     ed.tokens = &.{};
     ed.problems = &.{};
     ed.symbols = &.{};
+    ed.colors = &.{};
     const arena = ed.info.allocator();
     const text = ed.buffer.text.items;
     const service = ed.language.service;
@@ -256,6 +285,93 @@ pub fn refresh(ed: *Document) void {
         ed.problems = ed.placed(arena, said.problems) catch &.{};
     } else |_| {};
     ed.tokens = own orelse lexis.tokens(arena, &ed.language, text) catch &.{};
+    ed.colors = colors_mod.find(arena, text, ed.language.colors, ed.tokens) catch &.{};
+    // A colour picked is where it was written; one gone takes its picker.
+    if (ed.picking) |p| if (ed.colorAt(p.start) == null) {
+        ed.picking = null;
+    };
+}
+
+pub const Picking = struct {
+    start: u32,
+    state: ColorPicker.State,
+};
+
+/// The colour written from `start`, if one is.
+pub fn colorAt(ed: *const Document, start: u32) ?colors_mod.Found {
+    const i = ed.firstColor(start);
+    if (i < ed.colors.len and ed.colors[i].start == start) return ed.colors[i];
+    return null;
+}
+
+/// The first colour that starts at `offset` or after it.
+pub fn firstColor(ed: *const Document, offset: u32) usize {
+    var lo: usize = 0;
+    var hi = ed.colors.len;
+    while (lo < hi) {
+        const mid = (lo + hi) / 2;
+        if (ed.colors[mid].start < offset) lo = mid + 1 else hi = mid;
+    }
+    return lo;
+}
+
+/// How wide the swatch before a colour is: room in the line.
+pub fn swatchWidth(ed: *const Document) f32 {
+    return @round(ed.metrics.line_height * 0.9);
+}
+
+/// How many swatches are in the line from `line_start` up to and at
+/// `offset`: the room they take before it.
+fn swatchesBefore(ed: *const Document, line_start: u32, offset: u32) f32 {
+    if (ed.colors.len == 0) return 0;
+    const from = ed.firstColor(line_start);
+    const past = ed.firstColor(offset + 1);
+    return @as(f32, @floatFromInt(past - from)) * ed.swatchWidth();
+}
+
+/// Open the picker of the colour written from `start`.
+pub fn pickColor(ed: *Document, start: u32) void {
+    const found = ed.colorAt(start) orelse return;
+    ed.closePopups();
+    ed.picking = .{ .start = start, .state = .init(found.color) };
+    // What this picker does is a step of its own, not the last one's.
+    ed.buffer.last = .none;
+}
+
+/// Write the colour from `start` as `c`: in the language's `form`, one undo
+/// step each; or, when null, in the one it is in - or the first that can
+/// write it, a name having none for most colours - all a picker's changes
+/// one undo step. The caret stays where it was. Whether it could be written.
+pub fn setColor(ed: *Document, start: u32, c: Color, form: ?u8) Allocator.Error!bool {
+    ed.refresh();
+    const found = ed.colorAt(start) orelse return false;
+    const forms = ed.language.colors;
+    const b = &ed.buffer;
+    var buffer: [128]u8 = undefined;
+    const was = b.text.items[found.start..found.end];
+    const text = if (form) |which|
+        (if (which < forms.len) colors_mod.write(&buffer, forms[which], c, was) else null) orelse return false
+    else text: {
+        if (found.form < forms.len) if (colors_mod.write(&buffer, forms[found.form], c, was)) |w| break :text w;
+        for (forms) |f| if (colors_mod.write(&buffer, f, c, was)) |w| break :text w;
+        return false;
+    };
+    if (std.mem.eql(u8, text, was)) return true;
+    const cursor = b.cursor;
+    const anchor = b.anchor;
+    const grown: i64 = @as(i64, @intCast(text.len)) - @as(i64, @intCast(was.len));
+    try b.replace(found.start, found.end, text, if (form == null) .picking else .other);
+    b.cursor = shifted(cursor, found.end, grown);
+    b.anchor = shifted(anchor, found.end, grown);
+    ed.typed_at = ed.now;
+    ed.refresh();
+    return true;
+}
+
+/// An offset after a change that ends at `end` and grew by `grown`.
+fn shifted(offset: u32, end: u32, grown: i64) u32 {
+    if (offset < end) return offset;
+    return @intCast(@max(0, @as(i64, offset) + grown));
 }
 
 /// Problems with their lines and columns, and inside the text.
@@ -299,15 +415,91 @@ pub fn counts(ed: *const Document) struct { errors: usize, warnings: usize } {
 
 /// Asks what could be typed at the caret, and opens the list if anything could.
 pub fn complete(ed: *Document) void {
-    const service = ed.language.service;
-    const ask = service.complete orelse return;
     ed.refresh();
     _ = ed.completion.arena.reset(.retain_capacity);
+    ed.completion.path = false;
+    if (ed.pathAt(ed.buffer.cursor)) |at| return ed.completePath(at);
+    const service = ed.language.service;
+    const ask = service.complete orelse return;
     const found = (ask(service.context, ed.gpa, ed.completion.arena.allocator(), ed.path, ed.buffer.text.items, ed.buffer.cursor) catch null) orelse return ed.closeCompletion();
     ed.completion.items = found.items;
     ed.completion.start = found.start;
     ed.completion.open = found.items.len > 0;
     ed.filter();
+}
+
+/// What is in the folder the path at the caret has got to, from the host.
+fn completePath(ed: *Document, at: [2]u32) void {
+    const paths = ed.language.paths;
+    const list = paths.list orelse return ed.closeCompletion();
+    const typed = ed.buffer.text.items[at[0]..ed.buffer.cursor];
+    for (paths.schemes) |scheme| {
+        if (std.mem.startsWith(u8, typed, scheme)) break;
+    } else return ed.closeCompletion();
+    const slash = std.mem.lastIndexOfScalar(u8, typed, '/') orelse return ed.closeCompletion();
+    const items = list(paths.context, ed.completion.arena.allocator(), typed[0 .. slash + 1]) catch return ed.closeCompletion();
+    ed.completion.items = items;
+    ed.completion.start = at[0] + @as(u32, @intCast(slash)) + 1;
+    ed.completion.path = true;
+    ed.completion.open = items.len > 0;
+    ed.filter();
+}
+
+/// Where the text of the string around `offset` is, inside its quotes, as
+/// of the last `refresh`: a string still open at its line's end holds the
+/// offset at its end.
+pub fn stringAt(ed: *const Document, offset: u32) ?[2]u32 {
+    const text = ed.buffer.text.items;
+    const t = ed.firstToken(offset);
+    // The token going on past `offset`, or one that ends at it.
+    var i = if (t > 0) t - 1 else t;
+    while (i <= t and i < ed.tokens.len) : (i += 1) {
+        const token = ed.tokens[i];
+        if (token.style != .string or token.start > offset) continue;
+        var start = token.start;
+        var end = token.start + token.len;
+        if (end > text.len or end < offset) continue;
+        const quote = text[start];
+        var closed = false;
+        if (quote == '"' or quote == '\'') {
+            start += 1;
+            if (end > start and text[end - 1] == quote) {
+                end -= 1;
+                closed = true;
+            }
+        }
+        if (offset < start or offset > end) continue;
+        if (closed and offset == token.start + token.len) continue;
+        return .{ start, end };
+    }
+    return null;
+}
+
+/// The path in the string around `offset`: the string's text, when it
+/// starts with one of the language's `paths.schemes`.
+pub fn pathAt(ed: *const Document, offset: u32) ?[2]u32 {
+    const at = ed.stringAt(offset) orelse return null;
+    const text = ed.buffer.text.items[at[0]..at[1]];
+    for (ed.language.paths.schemes) |scheme| if (std.mem.startsWith(u8, text, scheme)) return at;
+    return null;
+}
+
+/// Take the path whose button was pressed: where its text is, for `setPath`
+/// once the host has had another chosen.
+pub fn takeChoice(ed: *Document) ?[2]u32 {
+    const at = ed.choosing orelse return null;
+    ed.choosing = null;
+    return at;
+}
+
+/// The string whose text starts at `start` becomes `path`, a step to undo,
+/// the caret after it; nothing, if no string starts there any more.
+pub fn setPath(ed: *Document, start: u32, path: []const u8) Allocator.Error!void {
+    ed.refresh();
+    const at = ed.stringAt(start) orelse return;
+    if (at[0] != start) return;
+    try ed.buffer.replace(at[0], at[1], path, .other);
+    ed.edited();
 }
 
 /// The items that match the word typed so far, best first: the service's
@@ -317,7 +509,7 @@ pub fn filter(ed: *Document) void {
     if (!c.open) return;
     if (ed.buffer.cursor < c.start or ed.buffer.selection() != null) return ed.closeCompletion();
     const typed = ed.buffer.text.items[c.start..ed.buffer.cursor];
-    for (typed) |ch| if (!Buffer.isWordChar(ch)) return ed.closeCompletion();
+    for (typed) |ch| if (!Buffer.isWordChar(ch) and !(c.path and inName(ch))) return ed.closeCompletion();
     c.shown.clearRetainingCapacity();
     for (c.items, 0..) |item, i| {
         if (fuzzy.score(typed, item.label, .{}) == null) continue;
@@ -348,6 +540,14 @@ pub fn filter(ed: *Document) void {
     c.first = 0;
 }
 
+/// Whether `c` can be in a file's name in a path.
+fn inName(c: u8) bool {
+    return switch (c) {
+        '/', '\\', '"', '\'', '\n' => false,
+        else => true,
+    };
+}
+
 pub fn closeCompletion(ed: *Document) void {
     ed.completion.open = false;
     ed.completion.shown.clearRetainingCapacity();
@@ -366,6 +566,19 @@ pub fn accept(ed: *Document, index: usize) Allocator.Error!void {
     if (index >= c.shown.items.len) return;
     const item = c.items[c.shown.items[index]];
     const b = &ed.buffer;
+    if (c.path) {
+        // The name to the next `/`, and a folder's `/` with it; what is in
+        // a folder next.
+        const folder = std.mem.endsWith(u8, item.label, "/");
+        const in = ed.stringAt(b.cursor) orelse [2]u32{ b.cursor, b.cursor };
+        const after = b.text.items[b.cursor..in[1]];
+        var end = b.cursor + @as(u32, @intCast(std.mem.indexOfScalar(u8, after, '/') orelse after.len));
+        if (folder and end < in[1]) end += 1;
+        try b.replace(c.start, end, item.label, .other);
+        ed.closeCompletion();
+        if (folder) ed.complete();
+        return;
+    }
     const end = b.wordEnd(b.cursor);
     const next: u8 = if (end < b.len()) b.text.items[end] else 0;
     if (item.call != .none and next != '(') {
@@ -423,12 +636,13 @@ pub fn closePopups(ed: *Document) void {
     ed.signature = null;
     ed.hover.shown = null;
     ed.hover.offset = null;
+    ed.picking = null;
 }
 
 /// Escape: what is open over the code closes, the lists first and then the
 /// bar. Whether anything did.
 pub fn cancel(ed: *Document) bool {
-    if (ed.completion.open or ed.signature != null or ed.hover.shown != null) {
+    if (ed.completion.open or ed.signature != null or ed.hover.shown != null or ed.picking != null) {
         ed.closePopups();
         return true;
     }
@@ -442,6 +656,14 @@ pub fn cancel(ed: *Document) bool {
 /// Where the name at `at` is declared: here, the caret goes there; in
 /// another file, that file is asked to be opened.
 pub fn goToDefinition(ed: *Document, at: u32) void {
+    ed.refresh();
+    // A path names its file: that is asked to be opened.
+    if (ed.pathAt(at)) |path| {
+        ed.dropRequest();
+        const copy = ed.gpa.dupe(u8, ed.buffer.text.items[path[0]..path[1]]) catch return;
+        ed.open_request = .{ .path = copy, .start = 0, .end = 0, .kind = .named };
+        return;
+    }
     const service = ed.language.service;
     const ask = service.definition orelse return;
     ed.refresh();
@@ -568,6 +790,14 @@ pub fn typeChar(ed: *Document, codepoint: u21) Allocator.Error!void {
     if (n == 1) try ed.buffer.typeChar(utf8[0]) else try ed.buffer.insert(utf8[0..n]);
     ed.edited();
     const c: u8 = if (n == 1) utf8[0] else 0;
+    // In a path: what is in the folder it has got to.
+    if (ed.language.paths.list != null) {
+        ed.refresh();
+        if (ed.pathAt(ed.buffer.cursor) != null) {
+            if (ed.completion.open and ed.completion.path and c != '/') ed.filter() else ed.complete();
+            return;
+        }
+    }
     const service = ed.language.service;
     if (Buffer.isWordChar(c)) {
         if (ed.completion.open) {
@@ -744,13 +974,14 @@ pub fn offsetInLine(ed: *const Document, line: u32, wanted: f32) u32 {
     const text = b.lineText(line);
     if (wanted <= 0) return start;
     var at: usize = 0;
-    var before: f32 = 0;
     while (at < text.len) {
         const step = std.unicode.utf8ByteSequenceLength(text[at]) catch 1;
         const next = @min(text.len, at + step);
-        const after = ed.widthOf(text[0..next]);
+        // A swatch before the character is room of its own, to its left.
+        const room = ed.swatchesBefore(start, start + @as(u32, @intCast(at)));
+        const before = ed.widthOf(text[0..at]) + room;
+        const after = ed.widthOf(text[0..next]) + room;
         if (wanted < (before + after) / 2) break;
-        before = after;
         at = next;
     }
     return start + @as(u32, @intCast(at));
@@ -763,7 +994,7 @@ pub fn xOf(ed: *const Document, offset: u32) f32 {
     const start = b.lineStart(line);
     const text = b.lineText(line);
     const upto = @min(text.len, offset - start);
-    return ed.widthOf(text[0..upto]);
+    return ed.widthOf(text[0..upto]) + ed.swatchesBefore(start, offset);
 }
 
 /// The wheel, in notches: three lines each.
@@ -793,7 +1024,7 @@ pub fn follow(ed: *Document) void {
     // Sideways, in pixels, with a character's room either side of the caret.
     const room = ed.metrics.line_height;
     const x = ed.xOf(ed.buffer.cursor);
-    const width = @max(64, ed.view[2] - ed.gutter);
+    const width = @max(64, ed.view[2] - ed.gutter - ed.aside);
     if (x < ed.left + room) ed.left = @max(0, x - room);
     if (x > ed.left + width - room) ed.left = x - width + room;
 }
@@ -1022,4 +1253,104 @@ test "places in a line are measured, not counted, in any font, and a tab reaches
     ed.follow();
     try testing.expect(ed.left > 0);
     try testing.expect(ed.xOf(19) - ed.left <= 100);
+}
+
+test "a colour in the text is found, a picker writes it back as one step, and a form of the language's another" {
+    const gpa = testing.allocator;
+    const forms = [_]colors_mod.Form{
+        .{ .channels = .{ .call = "color" } },
+        .{ .hex = .{ .call = "color" } },
+    };
+    var lang = @import("languages.zig").plain;
+    lang.colors = &forms;
+    var ed: Document = try .init(gpa, "t.txt", "tint = color(1, 0, 0) // red\n", lang, .{ .font_size = 16, .line_height = 16 });
+    defer ed.deinit();
+    ed.refresh();
+    try testing.expectEqual(@as(usize, 1), ed.colors.len);
+    const start: u32 = 7;
+    try testing.expectEqual(start, ed.colors[0].start);
+    try testing.expectEqual(@as(u8, 0), ed.colors[0].form);
+
+    // The caret after the comment's word, where it stays as the colour
+    // before it grows.
+    const red_at: u32 = @intCast(std.mem.indexOf(u8, ed.buffer.text.items, "red").?);
+    ed.buffer.moveTo(red_at, false);
+    ed.pickColor(start);
+    try testing.expect(ed.picking != null);
+    try testing.expect(try ed.setColor(start, .rgba(0, 1, 0, 1), null));
+    try testing.expect(try ed.setColor(start, .rgba(0, 0, 1, 1), null));
+    try testing.expectEqualStrings("tint = color(0.0, 0.0, 1.0) // red\n", ed.buffer.text.items);
+    try testing.expectEqualStrings("red", ed.buffer.text.items[ed.buffer.cursor..][0..3]);
+    try testing.expectEqual(@as(f32, 1), ed.colors[0].color.b);
+
+    // Another form: a step of its own.
+    try testing.expect(try ed.setColor(start, ed.colors[0].color, 1));
+    try testing.expectEqualStrings("tint = color(\"#0000FF\") // red\n", ed.buffer.text.items);
+    try testing.expectEqual(@as(u8, 1), ed.colors[0].form);
+    try ed.buffer.undo();
+    try testing.expectEqualStrings("tint = color(0.0, 0.0, 1.0) // red\n", ed.buffer.text.items);
+    try ed.buffer.undo();
+    try testing.expectEqualStrings("tint = color(1, 0, 0) // red\n", ed.buffer.text.items);
+    ed.refresh();
+
+    // The swatch takes room before the colour: the characters after it are
+    // that much further in, and a point is read back to the same offset.
+    ed.metrics.measure = .{ .widthFn = struct {
+        fn width(_: ?*const anyopaque, run: []const u8) f32 {
+            return @floatFromInt(run.len * 8);
+        }
+    }.width };
+    try testing.expectEqual(@as(f32, 6 * 8), ed.xOf(6));
+    try testing.expectEqual(@as(f32, 7 * 8) + ed.swatchWidth(), ed.xOf(start));
+    try testing.expectEqual(start + 1, ed.offsetInLine(0, ed.xOf(start + 1)));
+}
+
+/// A project with `art/hero.png` and `main.flux`, as a host lists it.
+fn toyList(_: ?*anyopaque, arena: Allocator, folder: []const u8) language_zig.Error![]const Item {
+    var items: std.ArrayList(Item) = .empty;
+    if (std.mem.eql(u8, folder, "res://")) {
+        try items.append(arena, .{ .label = "art/", .kind = .folder });
+        try items.append(arena, .{ .label = "main.flux", .kind = .file });
+    } else if (std.mem.eql(u8, folder, "res://art/")) {
+        try items.append(arena, .{ .label = "hero.png", .kind = .file });
+    }
+    return items.items;
+}
+
+test "a path in a string is completed from the host's folders, named for opening, and chosen anew" {
+    const gpa = testing.allocator;
+    var lang = @import("languages.zig").json;
+    lang.paths = .{ .schemes = &.{"res://"}, .list = toyList };
+    var ed: Document = try .init(gpa, "t.json", "{\"a\": \"\"}", lang, .{ .font_size = 16, .line_height = 16 });
+    defer ed.deinit();
+    ed.buffer.moveTo(7, false);
+    for ("res://") |c| try ed.typeChar(c);
+    // What is in the project's root.
+    try testing.expect(ed.completion.open and ed.completion.path);
+    try testing.expectEqual(@as(usize, 2), ed.completion.shown.items.len);
+    try ed.typeChar('a');
+    try testing.expectEqualStrings("art/", ed.selectedItem().?.label);
+    // A folder accepted: what is in it next.
+    _ = try ed.key(.enter, .{});
+    try testing.expectEqualStrings("{\"a\": \"res://art/\"}", ed.buffer.text.items);
+    try testing.expect(ed.completion.open);
+    try testing.expectEqualStrings("hero.png", ed.selectedItem().?.label);
+    _ = try ed.key(.enter, .{});
+    try testing.expectEqualStrings("{\"a\": \"res://art/hero.png\"}", ed.buffer.text.items);
+    try testing.expect(!ed.completion.open);
+
+    // Ctrl and a click on it: its file, to open for what it is.
+    ed.goToDefinition(12);
+    const request = ed.takeRequest() orelse return error.TestExpectedEqual;
+    defer gpa.free(request.path);
+    try testing.expectEqualStrings("res://art/hero.png", request.path);
+    try testing.expect(request.kind == .named);
+
+    // Another chosen for it.
+    const at = ed.pathAt(12) orelse return error.TestExpectedEqual;
+    try testing.expectEqual(@as(u32, 7), at[0]);
+    try ed.setPath(at[0], "res://main.flux");
+    try testing.expectEqualStrings("{\"a\": \"res://main.flux\"}", ed.buffer.text.items);
+    // A string with no scheme is no path, nor is a key.
+    try testing.expect(ed.pathAt(2) == null);
 }
