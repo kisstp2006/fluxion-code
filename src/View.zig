@@ -414,6 +414,8 @@ fn signature(v: View, ed: *Document, ui: *Ui) void {
             .anchor = .{ .element_y = if (above) .bottom else .top },
             .z_index = 22,
         },
+        // Something to read, not to press: the text under it answers.
+        .passthrough = true,
     });
     defer ui.close();
     ui.open(.{ .direction = .left_to_right });
@@ -447,6 +449,8 @@ fn hover(v: View, ed: *Document, ui: *Ui) void {
         .border = .all(v.theme.border, 1),
         .corner_radius = .all(4),
         .floating = .{ .offset = .{ .x = @max(ed.gutter, xOf(ed, @min(h.start, b.len()))), .y = yOf(ed, line) + ed.metrics.line_height + 2 }, .z_index = 23 },
+        // Something to read, not to press: the text under it answers.
+        .passthrough = true,
     });
     defer ui.close();
     var lines = std.mem.splitScalar(u8, h.code, '\n');
@@ -586,6 +590,21 @@ fn button(v: View, ed: *const Document, ui: *Ui, id: []const u8, label: []const 
 // ---------------------------------------------------------------------------
 // The mouse
 
+/// Whether the pointer is on the view - its text, the rows and the marks
+/// laid over it, a tooltip - and not on the list of completions or on
+/// anything else laid over it: where a press takes the keyboard and the
+/// wheel scrolls the text. The rows float over the view, so fluxion-ui's
+/// `isPointerOver` stops at them; `isPointerWithin` sees past.
+pub fn under(v: View, ui: *Ui) bool {
+    return ui.isPointerWithin(v.ids.code) and !v.overList(ui);
+}
+
+/// Whether the pointer is on the list of completions or the doc beside it,
+/// which answer it themselves.
+fn overList(v: View, ui: *Ui) bool {
+    return ui.isPointerWithin(v.ids.completion) or ui.isPointerWithin(v.ids.completion_doc);
+}
+
 pub const Pointer = struct {
     x: f32,
     y: f32,
@@ -601,8 +620,7 @@ pub const Pointer = struct {
 pub fn pointer(v: View, ed: *Document, ui: *Ui, p: Pointer) void {
     const x0, const y0, const w, const h = ed.view;
     const gutter = ed.gutter;
-    const over_popup = ui.isPointerOver(v.ids.completion) or ui.isPointerOver(v.ids.completion_doc) or ui.isPointerOver(v.ids.signature) or ui.isPointerOver(v.ids.hover);
-    const inside = p.x >= x0 and p.x < x0 + w and p.y >= y0 and p.y < y0 + h and !over_popup;
+    const inside = p.x >= x0 and p.x < x0 + w and p.y >= y0 and p.y < y0 + h and !v.overList(ui);
     if (!p.down) ed.drag = .none;
     switch (ed.drag) {
         .text => {
@@ -754,6 +772,40 @@ test "code is drawn in the code's font, and a doc in the prose font" {
     };
     try testing.expectEqual(@as(usize, 1), docs);
     try testing.expect(code_runs >= 3);
+}
+
+test "the view is under the pointer on its words and on its tooltip, and a press goes through the tooltip to the text" {
+    const gpa = testing.allocator;
+    var ed: Document = try .init(gpa, "t.txt", "fn f() {}\nthe second line of it\nand a third\n", languages.plain, .{ .font_size = 16, .line_height = 16 });
+    defer ed.deinit();
+    ed.refresh();
+    var ui: Ui = .init(gpa);
+    defer ui.deinit();
+    ui.setMeasurer(.monospace(0.5, 1.0));
+    var ruler: Ruler = .{};
+    const view: View = .{};
+    _ = try frame(view, &ed, &ui, &ruler);
+
+    // On a word of the first line: the row floats over the view, so the
+    // view is not what the pointer is over, and it is under the pointer.
+    const x = ed.gutter + 8 * 4;
+    ui.setPointer(x, 8, false);
+    _ = try frame(view, &ed, &ui, &ruler);
+    try testing.expect(!ui.isPointerOver(view.ids.code));
+    try testing.expect(view.under(&ui));
+
+    // A tooltip under the first line, over the second: the view is under
+    // the pointer there too, and a press goes to the text beneath it.
+    ed.hover.shown = .{ .start = 3, .end = 4, .code = "fn f()", .doc = null };
+    _ = try frame(view, &ed, &ui, &ruler);
+    const tip = ui.boxOf(view.ids.hover) orelse return error.TestExpectedEqual;
+    const at: [2]f32 = .{ tip.x + tip.width / 2, tip.y + tip.height / 2 };
+    ui.setPointer(at[0], at[1], true);
+    _ = try frame(view, &ed, &ui, &ruler);
+    try testing.expect(view.under(&ui));
+    view.pointer(&ed, &ui, .{ .x = at[0], .y = at[1], .down = true, .pressed = true, .mods = .{} });
+    try testing.expect(ed.hover.shown == null);
+    try testing.expect(ed.buffer.lineOf(ed.buffer.cursor) >= 1);
 }
 
 test "the find bar goes over the code, and the places it finds are lit" {

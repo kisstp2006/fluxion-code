@@ -69,11 +69,14 @@ defer doc.deinit();
 _ = try doc.key(.enter, .{});
 try doc.typeChar('a');
 view.pointer(&doc, &ui, .{ .x = x, .y = y, .down = down, .pressed = pressed, .mods = .{} });
+if (wheel != 0 and view.under(&ui)) doc.scroll(wheel, shift);
 doc.refresh();
 view.draw(&doc, &ui, true);
 // ...and once the frame is laid out:
 view.measure(&doc, &ui, 1);
 ```
+
+`view.under(&ui)` says whether the pointer is on the view - its words, the rows and marks it lays over itself, a tooltip - rather than on the list of completions or on something else over it: where a press takes the keyboard and the wheel scrolls. The rows float, so fluxion-ui's `isPointerOver` of the view is false on them; ask `under`. A tooltip and a signature let the pointer through to the text beneath.
 
 The text is kept as the file has it: its tabs stay tabs, drawn to the next stop, and `written` gives the text back with the file's own line breaks, `\r\n` or `\n`. `modified` says whether it changed since `markSaved`.
 
