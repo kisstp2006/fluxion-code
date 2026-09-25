@@ -42,6 +42,7 @@ pub const Signature = language.Signature;
 pub const Hover = language.Hover;
 pub const Symbol = language.Symbol;
 pub const Definition = language.Definition;
+pub const Paths = language.Paths;
 pub const Analysis = language.Analysis;
 pub const Error = language.Error;
 
@@ -49,6 +50,7 @@ pub const Metrics = Document.Metrics;
 pub const Measure = Document.Measure;
 pub const Key = Document.Key;
 pub const Mods = Document.Mods;
+pub const OpenRequest = Document.OpenRequest;
 pub const Ruler = View.Ruler;
 pub const Pointer = View.Pointer;
 
