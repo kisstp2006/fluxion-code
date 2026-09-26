@@ -6,7 +6,8 @@
 //! stop - and the line numbers go over the rows so that a line scrolled
 //! sideways passes under them. Over it all float the selection, the places
 //! the find bar found, the lines under mistakes, the caret, the scrollbar,
-//! and the completion list and the tooltips. The find bar goes above.
+//! the completion list and the tooltips, and the menu a right click opens.
+//! The find bar goes above.
 //!
 //! Every place is measured through the document's `Metrics`, so the font can
 //! be any: a `Ruler` measures with the interface's own measurer.
@@ -17,6 +18,7 @@ const Document = @import("Document.zig");
 const Theme = @import("Theme.zig");
 const search = @import("search.zig");
 const colors = @import("colors.zig");
+const commands = @import("commands.zig");
 
 const Ui = ui_lib.Ui;
 const Color = ui_lib.Color;
@@ -38,6 +40,9 @@ prose_font: u16 = 0,
 /// The minimap's texture, as a number in the table the interface's renderer
 /// was given - the host makes it from `minimapPixels` - or null for none.
 minimap_texture: ?u32 = null,
+/// The program's own rows of the menu a right click opens, after the
+/// document's in their groups: see `commands`.
+actions: []const commands.Action = &.{},
 
 pub const Ids = struct {
     code: []const u8 = "code",
@@ -51,6 +56,8 @@ pub const Ids = struct {
     choose: []const u8 = "code-choose",
     /// The find bar; its fields and buttons are named after it.
     find: []const u8 = "code-find",
+    /// The menu a right click opens; its rows are named after it.
+    menu: []const u8 = "code-menu",
 };
 
 /// How the interface measures the code, for `Document.Metrics`: keep one
@@ -63,11 +70,16 @@ pub const Ruler = struct {
         return .{ .context = self, .widthFn = widthOf };
     }
 
+    /// Measured as the interface draws it - at its scale, where a font's
+    /// size is a whole number of pixels - and back in the code's own
+    /// pixels. Measured at the size unscaled, a line whose size the scale
+    /// rounds would drift from its caret and its selection along its length.
     fn widthOf(context: ?*const anyopaque, run: []const u8) f32 {
         const self: *const Ruler = @ptrCast(@alignCast(context.?));
         const ui = self.ui orelse return 0;
         const measurer = ui.measurer orelse return 0;
-        return measurer.measure(run, self.style).width;
+        const scale = @max(ui.scale, 0.0001);
+        return measurer.measure(run, self.style.scaled(scale)).width / scale;
     }
 };
 
@@ -163,6 +175,103 @@ pub fn draw(v: View, ed: *Document, ui: *Ui, focused: bool) void {
     v.hover(ed, ui);
     v.picker(ed, ui);
     v.chooser(ed, ui);
+    v.menu(ed, ui);
+}
+
+/// The menu a right click opened: the document's rows and the program's in
+/// their groups, a line between each two, each with the keys that do the
+/// same. A row that cannot be done just now is greyed. It opens where it was
+/// asked, to the left of it or above it when there is no room.
+fn menu(v: View, ed: *Document, ui: *Ui) void {
+    if (!ed.menu.open) return;
+    var arranged: [commands.builtin.len + 32]?commands.Action = undefined;
+    const rows = commands.arrange(ed, v.actions, &arranged);
+    if (rows.len == 0) {
+        ed.menu.open = false;
+        return;
+    }
+    const row_height = ed.metrics.line_height + 4;
+    const line_height: f32 = 7;
+    var widest_label: f32 = 0;
+    var widest_keys: f32 = 0;
+    var height: f32 = 8;
+    for (rows) |entry| {
+        const action = entry orelse {
+            height += line_height;
+            continue;
+        };
+        widest_label = @max(widest_label, v.proseWidth(ed, ui, action.label));
+        widest_keys = @max(widest_keys, v.proseWidth(ed, ui, action.keys));
+        height += row_height;
+    }
+    const width = widest_label + widest_keys + 3 * em(ed) + 24;
+    // Inside the window, not only the view: a narrow view has the menu over
+    // what is beside it rather than cut off.
+    const scale = @max(ui.scale, 0.0001);
+    const x = placed(ed.view[0] + ed.menu.x, width, ui.surface.width / scale) - ed.view[0];
+    const y = placed(ed.view[1] + ed.menu.y, height, ui.surface.height / scale) - ed.view[1];
+
+    ui.open(.{
+        .id = v.ids.menu,
+        .width = .fixed(width),
+        .direction = .top_to_bottom,
+        .padding = .all(3),
+        .background_color = v.theme.popup,
+        .border = .all(v.theme.border, 1),
+        .corner_radius = .all(4),
+        .capture = true,
+        .preserve_focus = true,
+        .floating = .{ .offset = .{ .x = x, .y = y }, .z_index = 30 },
+    });
+    var chosen: ?commands.Action = null;
+    for (rows, 0..) |entry, i| {
+        const action = entry orelse {
+            ui.open(.{ .width = .grow, .padding = .xy(6, 3) });
+            ui.empty(.{ .width = .grow, .height = .fixed(1), .background_color = v.theme.border });
+            ui.close();
+            continue;
+        };
+        var name: [96]u8 = undefined;
+        const row_id = std.fmt.bufPrint(&name, "{s}-{d}", .{ v.ids.menu, i }) catch v.ids.menu;
+        const can = action.enabled(ed);
+        if (can and ui.isElementReleased(row_id)) chosen = action;
+        ui.open(.{
+            .id = row_id,
+            .width = .grow,
+            .height = .fixed(row_height),
+            .direction = .left_to_right,
+            .align_y = .center,
+            .padding = .xy(8, 0),
+            .corner_radius = .all(3),
+            .background_color = if (can and ui.isPointerOver(row_id)) v.theme.popup_selected else .transparent,
+        });
+        ui.text(action.label, v.proseStyle(ed, if (can) v.theme.ink else v.theme.faint));
+        ui.empty(.{ .width = .grow });
+        if (action.keys.len > 0) ui.text(action.keys, v.proseStyle(ed, if (can) v.theme.dim else v.theme.faint));
+        ui.close();
+    }
+    ui.close();
+    if (chosen) |action| {
+        ed.menu.open = false;
+        action.run(ed) catch {};
+    }
+}
+
+/// Where along a side of `room` something `size` long goes that was asked
+/// for at `at`: there, or ending there when it does not fit after, or as far
+/// in as it fits when it fits neither way.
+fn placed(at: f32, size: f32, room: f32) f32 {
+    if (at + size <= room) return at;
+    if (at - size >= 0) return at - size;
+    return @max(0, room - size);
+}
+
+/// How wide `text` is in the prose font, measured as the interface draws
+/// it: see `Ruler`.
+fn proseWidth(v: View, ed: *const Document, ui: *Ui, text: []const u8) f32 {
+    const measurer = ui.measurer orelse return @as(f32, @floatFromInt(text.len)) * em(ed);
+    const scale = @max(ui.scale, 0.0001);
+    return measurer.measure(text, v.proseStyle(ed, v.theme.ink).scaled(scale)).width / scale;
 }
 
 /// A button after the path the caret is in, which asks the host to have
@@ -262,7 +371,9 @@ fn minimap(v: View, ed: *Document, ui: *Ui) void {
     const shown = @min(tall, @max(ed.view[3], 1));
     const offset = minimapOffset(ed);
     const x = ed.view[2] - ed.aside;
-    rect(ui, x, 0, w, @max(ed.view[3], 1), v.theme.code, 7);
+    // The code does not go on under the minimap, nor peek out after it
+    // beside the scrollbar, which is drawn over this.
+    rect(ui, x, 0, ed.aside, @max(ed.view[3], 1), v.theme.code, 6);
     ui.empty(.{
         .width = .fixed(w),
         .height = .fixed(shown),
@@ -873,7 +984,7 @@ fn shapeAt(ed: *const Document, x: f32) ui_lib.CursorShape {
 /// Whether the pointer is on the list of completions or the doc beside it,
 /// which answer it themselves.
 fn overList(v: View, ui: *Ui) bool {
-    return ui.isPointerWithin(v.ids.completion) or ui.isPointerWithin(v.ids.completion_doc) or ui.isPointerWithin(v.ids.picker) or ui.isPointerWithin(v.ids.choose);
+    return ui.isPointerWithin(v.ids.completion) or ui.isPointerWithin(v.ids.completion_doc) or ui.isPointerWithin(v.ids.picker) or ui.isPointerWithin(v.ids.choose) or ui.isPointerWithin(v.ids.menu);
 }
 
 pub const Pointer = struct {
@@ -881,18 +992,31 @@ pub const Pointer = struct {
     y: f32,
     down: bool,
     pressed: bool,
+    /// The right button, pressed this frame: the menu.
+    secondary: bool = false,
     mods: Document.Mods,
 };
 
 /// What the mouse did to the text, from where everything was last frame:
 /// a click puts the caret, a drag selects, a second click takes the word
-/// and a third the line; ctrl and a click goes to the declaration; and
-/// resting on a name shows what it is.
+/// and a third the line; ctrl and a click goes to the declaration; resting
+/// on a name shows what it is; and the right button opens the menu, the
+/// caret put where it was pressed unless that is in the selection.
 pub fn pointer(v: View, ed: *Document, ui: *Ui, p: Pointer) void {
     const x0, const y0, const w, const h = ed.view;
     const gutter = ed.gutter;
     const inside = p.x >= x0 and p.x < x0 + w and p.y >= y0 and p.y < y0 + h and !v.overList(ui);
     if (!p.down) ed.drag = .none;
+    // A press anywhere but on the menu closes it.
+    if ((p.pressed or p.secondary) and ed.menu.open and !ui.isPointerWithin(v.ids.menu)) ed.menu.open = false;
+    if (p.secondary and inside and ed.drag == .none) {
+        v.focus(ui);
+        const at = ed.offsetAt(x0, y0, gutter, p.x, p.y);
+        const kept = if (ed.buffer.selection()) |s| at >= s[0] and at <= s[1] else false;
+        if (!kept) ed.buffer.moveTo(at, false);
+        ed.openMenu(p.x - x0, p.y - y0);
+        return;
+    }
     switch (ed.drag) {
         .text => {
             ed.buffer.moveTo(ed.offsetAt(x0, y0, gutter, p.x, p.y), true);
@@ -1009,6 +1133,34 @@ test "a line's indentation is drawn as part of its text, and the caret where the
     // third line; and the view found by the name it was given.
     try testing.expectEqual(gutter + 8 * 8, xOf(&ed, ed.buffer.cursor));
     try testing.expectEqual(@as(f32, 800), ed.view[2]);
+}
+
+test "the caret and the selection keep to the text at a scale that rounds the font's size" {
+    const gpa = testing.allocator;
+    // 14 at 1.25 is 17.5, which the interface draws at 18.
+    var ed: Document = try .init(gpa, "t.txt", "a line of some length, all the way to its end;\n", languages.plain, .{ .font_size = 14, .line_height = 18 });
+    defer ed.deinit();
+    ed.refresh();
+    var ui: Ui = .init(gpa);
+    defer ui.deinit();
+    ui.setMeasurer(.monospace(0.5, 1.0));
+    var ruler: Ruler = .{ .ui = &ui, .style = .{ .font_size = 14 } };
+    ed.metrics.measure = ruler.measure();
+    ed.buffer.moveTo(ed.buffer.lineEnd(0), false);
+    const view: View = .{};
+    ui.begin(.{ .size = .init(1000, 750), .scale = 1.25 });
+    ui.open(.{ .width = .grow, .height = .grow });
+    view.draw(&ed, &ui, true);
+    ui.close();
+    const drawn = try ui.end();
+
+    const line = ed.buffer.lineText(0);
+    const text_end = for (drawn) |c| {
+        if (c.config == .text and std.mem.eql(u8, c.config.text.text, line)) break c.bounding_box.x + c.bounding_box.width;
+    } else return error.TestExpectedEqual;
+    try testing.expectApproxEqAbs(text_end, xOf(&ed, ed.buffer.cursor) * ui.scale, 0.01);
+    // A character of 18 pixels' font is 9 of them wide, 7.2 of the code's.
+    try testing.expectApproxEqAbs(@as(f32, 7.2), ed.metrics.measure.width("a"), 0.001);
 }
 
 test "a press gives the code the keyboard, every key of it: Tab does not move the focus on" {
@@ -1292,4 +1444,92 @@ test "a button after the path the caret is in asks for another" {
     ui.setPointer(bx, by, false);
     _ = try frame(view, &ed, &ui, &ruler);
     try testing.expectEqual([2]u32{ 7, 18 }, ed.takeChoice().?);
+}
+
+/// The box of the menu's row that says `label`, from what was drawn.
+fn menuRow(drawn: []const ui_lib.RenderCommand, label: []const u8) ?ui_lib.BoundingBox {
+    for (drawn) |c| {
+        if (c.config == .text and std.mem.eql(u8, c.config.text.text, label)) return c.bounding_box;
+    }
+    return null;
+}
+
+/// A click of the left button at the middle of `box`, over two frames.
+fn clickAt(view: View, ed: *Document, ui: *Ui, ruler: *Ruler, box: ui_lib.BoundingBox) !void {
+    const x = box.x + box.width / 2;
+    const y = box.y + box.height / 2;
+    ui.setPointer(x, y, true);
+    view.pointer(ed, ui, .{ .x = x, .y = y, .down = true, .pressed = true, .mods = .{} });
+    _ = try frame(view, ed, ui, ruler);
+    ui.setPointer(x, y, false);
+    view.pointer(ed, ui, .{ .x = x, .y = y, .down = false, .pressed = false, .mods = .{} });
+    _ = try frame(view, ed, ui, ruler);
+}
+
+test "a right click opens the menu: the caret put there, the rows in their groups, a greyed one doing nothing, and the program's own" {
+    const gpa = testing.allocator;
+    var ed: Document = try .init(gpa, "t.txt", "hello world\nsecond line\n", languages.plain, .{ .font_size = 16, .line_height = 16 });
+    defer ed.deinit();
+    ed.refresh();
+    var ui: Ui = .init(gpa);
+    defer ui.deinit();
+    ui.setMeasurer(.monospace(0.5, 1.0));
+    var ruler: Ruler = .{};
+    const Program = struct {
+        var said: u32 = 0;
+        fn say(_: ?*anyopaque, _: *Document) void {
+            said += 1;
+        }
+    };
+    const own = [_]commands.Action{.{ .label = "Say it", .group = .run, .when = .selection, .does = .{ .host = .{ .run = Program.say } } }};
+    const view: View = .{ .actions = &own };
+    _ = try frame(view, &ed, &ui, &ruler);
+    _ = try frame(view, &ed, &ui, &ruler);
+
+    // On the `o` of "world": the caret goes there.
+    const x = gutterWidth(&ed) + 7 * 8 + 3;
+    ui.setPointer(x, 8, false);
+    view.pointer(&ed, &ui, .{ .x = x, .y = 8, .down = false, .pressed = false, .secondary = true, .mods = .{} });
+    try testing.expect(ed.menu.open);
+    try testing.expectEqual(@as(u32, 7), ed.buffer.cursor);
+    var drawn = try frame(view, &ed, &ui, &ruler);
+    try testing.expect(menuRow(drawn, "Cut") != null);
+    try testing.expect(menuRow(drawn, "Go to line") != null);
+    // Plain text has no declarations and no comments, and nothing is
+    // selected for the program's row.
+    try testing.expect(menuRow(drawn, "Go to definition") == null);
+    try testing.expect(menuRow(drawn, "Toggle comment") == null);
+    try testing.expect(menuRow(drawn, "Say it") == null);
+    // The rows in their groups' order: the change's before the clipboard's.
+    try testing.expect(menuRow(drawn, "Indent").?.y < menuRow(drawn, "Paste").?.y);
+
+    // Undo has nothing to undo: pressing it does nothing, and the menu stays.
+    try clickAt(view, &ed, &ui, &ruler, menuRow(drawn, "Undo").?);
+    try testing.expect(ed.menu.open);
+    drawn = try frame(view, &ed, &ui, &ruler);
+    try clickAt(view, &ed, &ui, &ruler, menuRow(drawn, "Select all").?);
+    try testing.expect(!ed.menu.open);
+    try testing.expectEqualStrings("hello world\nsecond line\n", ed.buffer.selectedText());
+
+    // A right click in the selection keeps it, and the program's row is there.
+    // What the pointer is over is found when it is set, from the frame
+    // before: set again once the menu has gone.
+    ui.setPointer(x, 8, false);
+    _ = try frame(view, &ed, &ui, &ruler);
+    ui.setPointer(x, 8, false);
+    view.pointer(&ed, &ui, .{ .x = x, .y = 8, .down = false, .pressed = false, .secondary = true, .mods = .{} });
+    try testing.expect(ed.menu.open);
+    try testing.expect(ed.buffer.selection() != null);
+    drawn = try frame(view, &ed, &ui, &ruler);
+    try clickAt(view, &ed, &ui, &ruler, menuRow(drawn, "Say it").?);
+    try testing.expectEqual(@as(u32, 1), Program.said);
+
+    // Escape closes it.
+    ui.setPointer(x, 8, false);
+    _ = try frame(view, &ed, &ui, &ruler);
+    ui.setPointer(x, 8, false);
+    view.pointer(&ed, &ui, .{ .x = x, .y = 8, .down = false, .pressed = false, .secondary = true, .mods = .{} });
+    try testing.expect(ed.menu.open);
+    try testing.expect(try ed.key(.escape, .{}));
+    try testing.expect(!ed.menu.open);
 }

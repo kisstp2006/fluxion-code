@@ -19,6 +19,7 @@ Plain text, Markdown and JSON come with it. A program adds its own languages and
 | `languages` | `plain`, `markdown` and `json`. |
 | `search` | Finding words: the next place either way round, whole words, matching case, replacing them all. |
 | `colors` | The ways a language writes a colour, finding the colours a text writes, and writing one back in any of those ways. |
+| `commands` | What the code can be told to do, as data: each `Command` done in one place, and the menu a right click opens as a table of `Action` rows the program adds its own to. |
 
 ## A language
 
@@ -97,10 +98,13 @@ var doc: code.Document = try .init(gpa, "notes.md", text, code.languages.markdow
 });
 defer doc.deinit();
 
+// The program's clipboard, for Cut, Copy and Paste.
+doc.clipboard = .{ .context = app, .get = clipboardText, .set = setClipboardText, .has = hasClipboardText };
+
 // Every frame: the keys and characters, the pointer, then the view.
 _ = try doc.key(.enter, .{});
 try doc.typeChar('a');
-view.pointer(&doc, &ui, .{ .x = x, .y = y, .down = down, .pressed = pressed, .mods = .{} });
+view.pointer(&doc, &ui, .{ .x = x, .y = y, .down = down, .pressed = pressed, .secondary = right_pressed, .mods = .{} });
 if (wheel != 0 and view.under(&ui)) doc.scroll(wheel, shift);
 doc.refresh();
 view.draw(&doc, &ui, window_focused and view.hasKeys(&ui));
@@ -123,6 +127,26 @@ view.minimap_texture = texture_number;
 
 The text is kept as the file has it: its tabs stay tabs, drawn to the next stop, and `written` gives the text back with the file's own line breaks, `\r\n` or `\n`. `modified` says whether it changed since `markSaved`.
 
+**Measured as it is drawn.** A `Ruler` measures the code at the interface's scale, where a font's size is a whole number of pixels, and back in the code's own pixels: at a scale that rounds the size - 14 at 1.25 is drawn at 18 - the caret and the selection stay on the characters to the end of a long line.
+
+## Commands and the menu
+
+Everything the code can be told to do is a `Command`, done in one place, `doc.perform(command)`, whether a key asked for it, the menu, or the program - an Edit menu of its own, say. `doc.can(command)` says whether it can be done just now: Cut and Copy with something selected and a clipboard, Undo with something to undo, Toggle comment in a language with line comments.
+
+A right click opens a menu where it was pressed, the caret put there unless that is in the selection. The menu is a table: each `Action` row says what it is called, the keys that do the same, its group - to what the caret is on, run, change, clipboard, history, find, the file - and `when` it is there at all: always, with a selection, on a name the language can find the declaration of or say what it is, in a path, on a colour, in a language with comments. The groups come in that order with a line between, a row that cannot be done just now is greyed, and the menu keeps inside the window. Its own rows go to a declaration and say what a name is, open a path's file, pick a colour, comment, indent and unindent, duplicate, move and delete lines, change a selection's case, cut, copy, paste and select all, undo and redo, and find, replace and go to a line.
+
+The program adds its rows with `view.actions`, each done by its own function, with `shows` to say whether it is there for this file and `can` whether it can be done now:
+
+```zig
+const run_in_game: code.Action = .{
+    .label = "Run in the game",
+    .group = .run,
+    .when = .selection,
+    .does = .{ .host = .{ .context = game, .run = runSelection, .shows = isScript, .can = gameRuns } },
+};
+view.actions = &.{run_in_game};
+```
+
 ## Keys
 
 | Keys | What they do |
@@ -130,12 +154,17 @@ The text is kept as the file has it: its tabs stay tabs, drawn to the next stop,
 | Arrows, Home, End, Page Up, Page Down, with Shift and Ctrl | Move, select, by words, to the ends |
 | Enter, Tab, Shift+Tab | A new line indented as the language says; indent or unindent the lines picked |
 | Ctrl+Z, Ctrl+Y, Ctrl+Shift+Z | Undo, redo |
+| Ctrl+X, Ctrl+C, Ctrl+V, Ctrl+A | Cut, copy, paste, select all |
 | Ctrl+/ | Comment the lines picked, or uncomment them |
+| Ctrl+Shift+D, Ctrl+Shift+K | Duplicate the lines picked, delete them |
+| Alt+Up, Alt+Down | Move the lines picked up or down, one step to undo however far |
+| Ctrl+Shift+U, Ctrl+U | The selection in upper case, in lower case |
 | Ctrl+Space | Completions |
 | F12, Ctrl+click | Go to the declaration, or open the file a path names |
 | Ctrl+F, Ctrl+H, Ctrl+G | Find, replace, go to a line |
 | F3, Shift+F3 | The next place, the one before |
-| Escape | Close the lists and the colour picker over the code, then the find bar |
+| Right click | The menu, at the pointer |
+| Escape | Close the menu, the lists and the colour picker over the code, then the find bar |
 
 ## In a program that has fluxion-ui already
 

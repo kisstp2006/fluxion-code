@@ -19,6 +19,7 @@ const lexis = @import("lexis.zig");
 const search = @import("search.zig");
 const Buffer = @import("Buffer.zig");
 const colors_mod = @import("colors.zig");
+const commands = @import("commands.zig");
 const ColorPicker = @import("fluxion_ui").ColorPicker;
 const Color = @import("fluxion_ui").Color;
 
@@ -49,9 +50,28 @@ pub const Measure = struct {
     }
 };
 
-pub const Key = enum { left, right, up, down, home, end, page_up, page_down, backspace, delete, enter, tab, escape, space, f3, f12, a, f, g, h, y, z, slash };
+pub const Key = enum { left, right, up, down, home, end, page_up, page_down, backspace, delete, enter, tab, escape, space, f3, f12, a, c, d, f, g, h, k, u, v, x, y, z, slash };
 
-pub const Mods = struct { shift: bool = false, ctrl: bool = false };
+pub const Mods = struct { shift: bool = false, ctrl: bool = false, alt: bool = false };
+
+/// The program's clipboard, for Cut, Copy and Paste: none, and they are
+/// greyed. `get` hands over text that lasts until it is asked again, and is
+/// asked only to paste; `has` says whether there is any to paste without
+/// reading it, as a menu open for a while asks every frame.
+pub const Clipboard = struct {
+    context: ?*anyopaque = null,
+    get: ?*const fn (context: ?*anyopaque) []const u8 = null,
+    set: ?*const fn (context: ?*anyopaque, text: []const u8) void = null,
+    has: ?*const fn (context: ?*anyopaque) bool = null,
+};
+
+/// The menu a right click opens, where it was opened: in the view's pixels,
+/// from its top left.
+pub const Menu = struct {
+    open: bool = false,
+    x: f32 = 0,
+    y: f32 = 0,
+};
 
 pub const Completion = struct {
     open: bool = false,
@@ -73,6 +93,9 @@ pub const Hovering = struct {
     /// Where the pointer has rested, and since when.
     offset: ?u32 = null,
     since: f64 = 0,
+    /// Shown at the caret, by `show_docs`: it stays, wherever the pointer
+    /// rests, until something else is done.
+    at_caret: bool = false,
     shown: ?language_zig.Hover = null,
     arena: std.heap.ArenaAllocator,
 };
@@ -145,6 +168,8 @@ signature: ?language_zig.Signature = null,
 signature_arena: std.heap.ArenaAllocator,
 hover: Hovering,
 find: Find = .{},
+menu: Menu = .{},
+clipboard: Clipboard = .{},
 
 /// Set by go to definition when the declaration is in another file.
 open_request: ?OpenRequest = null,
@@ -618,6 +643,7 @@ pub fn askSignature(ed: *Document) void {
 /// The pointer has rested on `offset`: after a moment, what is there is shown.
 pub fn rest(ed: *Document, offset: ?u32) void {
     const h = &ed.hover;
+    if (h.at_caret) return;
     if (offset == null) {
         h.offset = null;
         h.shown = null;
@@ -645,13 +671,15 @@ pub fn closePopups(ed: *Document) void {
     ed.signature = null;
     ed.hover.shown = null;
     ed.hover.offset = null;
+    ed.hover.at_caret = false;
     ed.picking = null;
+    ed.menu.open = false;
 }
 
 /// Escape: what is open over the code closes, the lists first and then the
 /// bar. Whether anything did.
 pub fn cancel(ed: *Document) bool {
-    if (ed.completion.open or ed.signature != null or ed.hover.shown != null or ed.picking != null) {
+    if (ed.completion.open or ed.signature != null or ed.hover.shown != null or ed.picking != null or ed.menu.open) {
         ed.closePopups();
         return true;
     }
@@ -686,6 +714,120 @@ pub fn goToDefinition(ed: *Document, at: u32) void {
         return;
     }
     ed.select(decl.start, decl.end);
+}
+
+/// What the name at the caret is, shown there at once: what resting the
+/// pointer on it shows after a moment.
+pub fn showDocs(ed: *Document) void {
+    const service = ed.language.service;
+    const ask = service.hover orelse return;
+    ed.refresh();
+    const h = &ed.hover;
+    _ = h.arena.reset(.retain_capacity);
+    h.shown = (ask(service.context, ed.state, h.arena.allocator(), ed.buffer.text.items, ed.buffer.cursor) catch return) orelse return;
+    h.offset = ed.buffer.cursor;
+    h.at_caret = true;
+}
+
+// ---------------------------------------------------------------------------
+// Commands, from a key, the menu or the program
+
+/// Whether the caret is on a name: in it, or just after it.
+fn onName(ed: *const Document) bool {
+    const b = &ed.buffer;
+    return b.wordStart(b.cursor) != b.wordEnd(b.cursor);
+}
+
+/// The colour the caret is on, by where it starts.
+fn colorAtCaret(ed: *const Document) ?u32 {
+    const at = ed.buffer.cursor;
+    for (ed.colors) |found| {
+        if (found.start > at) break;
+        if (at <= found.end) return found.start;
+    }
+    return null;
+}
+
+/// Whether what a menu row asks of the caret and the file holds.
+pub fn holds(ed: *const Document, when: commands.When) bool {
+    const service = ed.language.service;
+    return switch (when) {
+        .always => true,
+        .selection => ed.buffer.selection() != null,
+        .definition => service.definition != null and ed.onName(),
+        .docs => service.hover != null and ed.onName(),
+        .path => ed.pathAt(ed.buffer.cursor) != null,
+        .color => ed.colorAtCaret() != null,
+        .comments => ed.language.line_comment != null,
+    };
+}
+
+/// Whether `command` can be done just now.
+pub fn can(ed: *const Document, command: commands.Command) bool {
+    const b = &ed.buffer;
+    return switch (command) {
+        // F12 on a path opens its file, whatever the language knows.
+        .go_to_definition => ed.holds(.definition) or ed.holds(.path),
+        .show_docs => ed.holds(.docs),
+        .open_path => ed.holds(.path),
+        .pick_color => ed.holds(.color),
+        .toggle_comment => ed.holds(.comments),
+        .upper_case, .lower_case => b.selection() != null,
+        .cut, .copy => b.selection() != null and ed.clipboard.set != null,
+        .paste => ed.clipboard.get != null and if (ed.clipboard.has) |has| has(ed.clipboard.context) else true,
+        .undo => b.canUndo(),
+        .redo => b.canRedo(),
+        .move_lines_up => b.selectedLines()[0] > 0,
+        .move_lines_down => b.selectedLines()[1] + 1 < b.lineCount(),
+        .indent, .unindent, .duplicate_lines, .delete_lines, .select_all, .find, .replace, .go_to_line => true,
+    };
+}
+
+/// Do `command`, if it can be done: what its keys and its menu row do.
+pub fn perform(ed: *Document, command: commands.Command) Allocator.Error!void {
+    if (!ed.can(command)) return;
+    const b = &ed.buffer;
+    ed.menu.open = false;
+    switch (command) {
+        .go_to_definition, .open_path => return ed.goToDefinition(b.cursor),
+        .show_docs => return ed.showDocs(),
+        .pick_color => return ed.pickColor(ed.colorAtCaret().?),
+        .select_all => return b.selectAll(),
+        .find => return ed.openFind(.find),
+        .replace => return ed.openFind(.replace),
+        .go_to_line => return ed.openFind(.line),
+        .copy => return ed.clipboard.set.?(ed.clipboard.context, b.selectedText()),
+        .cut => {
+            ed.clipboard.set.?(ed.clipboard.context, b.selectedText());
+            try b.backspace();
+        },
+        .paste => {
+            // A line break is one character here, however the clipboard
+            // writes it.
+            const clean = try std.mem.replaceOwned(u8, ed.gpa, ed.clipboard.get.?(ed.clipboard.context), "\r", "");
+            defer ed.gpa.free(clean);
+            if (clean.len == 0) return;
+            try b.insert(clean);
+        },
+        .toggle_comment => try b.toggleComment(),
+        .indent => try b.shiftLines(false),
+        .unindent => try b.shiftLines(true),
+        .duplicate_lines => try b.duplicateLines(),
+        .move_lines_up => try b.moveLines(true),
+        .move_lines_down => try b.moveLines(false),
+        .delete_lines => try b.deleteLines(),
+        .upper_case => try b.changeCase(true),
+        .lower_case => try b.changeCase(false),
+        .undo => try b.undo(),
+        .redo => try b.redo(),
+    }
+    ed.edited();
+}
+
+/// The menu opened at (`x`, `y`) of the view, over whatever else was open.
+pub fn openMenu(ed: *Document, x: f32, y: f32) void {
+    ed.closePopups();
+    ed.menu = .{ .open = true, .x = x, .y = y };
 }
 
 /// `start..end` picked, the caret at its end, and in view.
@@ -831,6 +973,11 @@ pub fn typeChar(ed: *Document, codepoint: u21) Allocator.Error!void {
 pub fn key(ed: *Document, k: Key, mods: Mods) Allocator.Error!bool {
     const b = &ed.buffer;
     const c = &ed.completion;
+    // A key closes the menu, and does what it does.
+    if (ed.menu.open) {
+        ed.menu.open = false;
+        if (k == .escape) return true;
+    }
     if (c.open) switch (k) {
         .up, .down, .page_up, .page_down => {
             const count = c.shown.items.len;
@@ -857,6 +1004,11 @@ pub fn key(ed: *Document, k: Key, mods: Mods) Allocator.Error!bool {
         },
         else => {},
     };
+    // The chords of commands, each done where the menu does it.
+    if (commandOf(k, mods)) |command| {
+        try ed.perform(command);
+        return true;
+    }
     switch (k) {
         .left => b.moveLeft(mods.shift, mods.ctrl),
         .right => b.moveRight(mods.shift, mods.ctrl),
@@ -891,7 +1043,7 @@ pub fn key(ed: *Document, k: Key, mods: Mods) Allocator.Error!bool {
             return true;
         },
         .tab => {
-            if (mods.shift) try b.shiftLines(true) else try b.tab();
+            try b.tab();
             ed.edited();
             return true;
         },
@@ -904,44 +1056,47 @@ pub fn key(ed: *Document, k: Key, mods: Mods) Allocator.Error!bool {
             _ = ed.findNext(!mods.shift);
             return true;
         },
-        .f12 => {
-            ed.goToDefinition(b.cursor);
-            return true;
-        },
-        .a => if (mods.ctrl) b.selectAll() else return false,
-        .f => if (mods.ctrl) {
-            ed.openFind(.find);
-            return true;
-        } else return false,
-        .h => if (mods.ctrl) {
-            ed.openFind(.replace);
-            return true;
-        } else return false,
-        .g => if (mods.ctrl) {
-            ed.openFind(.line);
-            return true;
-        } else return false,
-        .z => if (mods.ctrl) {
-            if (mods.shift) try b.redo() else try b.undo();
-            ed.edited();
-            return true;
-        } else return false,
-        .y => if (mods.ctrl) {
-            try b.redo();
-            ed.edited();
-            return true;
-        } else return false,
-        .slash => if (mods.ctrl) {
-            try b.toggleComment();
-            ed.edited();
-            return true;
-        } else return false,
+        .f12, .a, .c, .d, .f, .g, .h, .k, .u, .v, .x, .y, .z, .slash => return false,
     }
-    // The caret moved: the lists that were about where it was go.
+    // The caret moved: the lists that were about where it was go, and what
+    // was shown of the name it was on.
     ed.reveal = true;
     ed.closeCompletion();
+    if (ed.hover.at_caret) {
+        ed.hover.at_caret = false;
+        ed.hover.shown = null;
+    }
     if (ed.signature != null) ed.askSignature();
     return true;
+}
+
+/// The command a key and its modifiers are, if any: the keys `commands`
+/// shows beside each row.
+fn commandOf(k: Key, mods: Mods) ?commands.Command {
+    if (mods.alt) return switch (k) {
+        .up => .move_lines_up,
+        .down => .move_lines_down,
+        else => null,
+    };
+    if (k == .f12) return .go_to_definition;
+    if (k == .tab and mods.shift) return .unindent;
+    if (!mods.ctrl) return null;
+    return switch (k) {
+        .a => .select_all,
+        .c => .copy,
+        .x => .cut,
+        .v => .paste,
+        .f => .find,
+        .h => .replace,
+        .g => .go_to_line,
+        .y => .redo,
+        .z => if (mods.shift) .redo else .undo,
+        .slash => .toggle_comment,
+        .d => if (mods.shift) .duplicate_lines else null,
+        .k => if (mods.shift) .delete_lines else null,
+        .u => if (mods.shift) .upper_case else .lower_case,
+        else => null,
+    };
 }
 
 pub const visible_items = 10;
@@ -1397,4 +1552,52 @@ test "a path in a string is completed from the host's folders, named for opening
     try testing.expectEqualStrings("{\"a\": \"res://main.flux\"}", ed.buffer.text.items);
     // A string with no scheme is no path, nor is a key.
     try testing.expect(ed.pathAt(2) == null);
+}
+
+test "the keys of commands do what the menu does: the clipboard, lines duplicated and moved" {
+    var ed: Document = try .init(testing.allocator, "t.toy", "alpha\nbeta", Toy.lang, test_metrics);
+    defer ed.deinit();
+    ed.buffer.moveTo(0, false);
+    ed.buffer.moveTo(5, true);
+    // With no clipboard, cut, copy and paste cannot be done.
+    try testing.expect(!ed.can(.copy));
+    try testing.expect(!ed.can(.paste));
+
+    const Board = struct {
+        held: [64]u8 = undefined,
+        len: usize = 0,
+        fn get(context: ?*anyopaque) []const u8 {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            return self.held[0..self.len];
+        }
+        fn set(context: ?*anyopaque, text: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            @memcpy(self.held[0..text.len], text);
+            self.len = text.len;
+        }
+    };
+    var board: Board = .{};
+    ed.clipboard = .{ .context = &board, .get = Board.get, .set = Board.set };
+    try testing.expect(try ed.key(.c, .{ .ctrl = true }));
+    try testing.expectEqualStrings("alpha", board.held[0..board.len]);
+    // Pasted with its line breaks as this text has them.
+    Board.set(&board, "x\r\ny");
+    ed.buffer.moveTo(ed.buffer.len(), false);
+    _ = try ed.key(.v, .{ .ctrl = true });
+    try testing.expectEqualStrings("alpha\nbetax\ny", ed.buffer.text.items);
+
+    ed.buffer.moveTo(0, false);
+    _ = try ed.key(.d, .{ .ctrl = true, .shift = true });
+    try testing.expectEqualStrings("alpha\nalpha\nbetax\ny", ed.buffer.text.items);
+    ed.buffer.moveTo(ed.buffer.lineStart(2), false);
+    _ = try ed.key(.up, .{ .alt = true });
+    try testing.expectEqualStrings("alpha\nbetax\nalpha\ny", ed.buffer.text.items);
+    try testing.expectEqual(@as(u32, 1), ed.buffer.lineOf(ed.buffer.cursor));
+    _ = try ed.key(.k, .{ .ctrl = true, .shift = true });
+    try testing.expectEqualStrings("alpha\nalpha\ny", ed.buffer.text.items);
+
+    // Nothing selected, nothing to change the case of; the key is taken.
+    try testing.expect(!ed.can(.upper_case));
+    try testing.expect(try ed.key(.u, .{ .ctrl = true, .shift = true }));
+    try testing.expectEqualStrings("alpha\nalpha\ny", ed.buffer.text.items);
 }

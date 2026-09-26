@@ -21,6 +21,7 @@ pub const lexis = @import("lexis.zig");
 pub const languages = @import("languages.zig");
 pub const search = @import("search.zig");
 pub const colors = @import("colors.zig");
+pub const commands = @import("commands.zig");
 pub const Buffer = @import("Buffer.zig");
 pub const Document = @import("Document.zig");
 pub const View = @import("View.zig");
@@ -51,6 +52,9 @@ pub const Measure = Document.Measure;
 pub const Key = Document.Key;
 pub const Mods = Document.Mods;
 pub const OpenRequest = Document.OpenRequest;
+pub const Clipboard = Document.Clipboard;
+pub const Command = commands.Command;
+pub const Action = commands.Action;
 pub const Ruler = View.Ruler;
 pub const Pointer = View.Pointer;
 
@@ -61,6 +65,7 @@ test {
     _ = languages;
     _ = search;
     _ = colors;
+    _ = commands;
     _ = Buffer;
     _ = Document;
     _ = View;

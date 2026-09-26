@@ -67,7 +67,7 @@ saved: u64 = 0,
 const State = struct { text: []u8, cursor: u32, anchor: u32 };
 /// What a change is, for the undo: changes of one kind in a row are one
 /// step, but for `other`.
-pub const Change = enum { none, typing, deleting, other, picking };
+pub const Change = enum { none, typing, deleting, other, picking, moving };
 const max_undo = 400;
 
 pub fn init(gpa: Allocator, text: []const u8, rules: Rules) Allocator.Error!Buffer {
@@ -378,12 +378,19 @@ pub fn tab(b: *Buffer) Allocator.Error!void {
     }
 }
 
-/// The selected lines, or the caret's, moved a level right or left.
-pub fn shiftLines(b: *Buffer, left: bool) Allocator.Error!void {
+/// The first and the last line the selection is on, or the caret's line:
+/// a selection that ends at the start of a line leaves that line out.
+pub fn selectedLines(b: *const Buffer) [2]u32 {
     const s = b.selection() orelse [2]u32{ b.cursor, b.cursor };
     const first = b.lineOf(s[0]);
     var last = b.lineOf(s[1]);
     if (last > first and s[1] == b.lineStart(last)) last -= 1;
+    return .{ first, last };
+}
+
+/// The selected lines, or the caret's, moved a level right or left.
+pub fn shiftLines(b: *Buffer, left: bool) Allocator.Error!void {
+    const first, const last = b.selectedLines();
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(b.gpa);
     var line = first;
@@ -411,10 +418,7 @@ pub fn shiftLines(b: *Buffer, left: bool) Allocator.Error!void {
 /// each has one. Nothing for a language with no comments.
 pub fn toggleComment(b: *Buffer) Allocator.Error!void {
     const mark = b.rules.line_comment orelse return;
-    const s = b.selection() orelse [2]u32{ b.cursor, b.cursor };
-    const first = b.lineOf(s[0]);
-    var last = b.lineOf(s[1]);
-    if (last > first and s[1] == b.lineStart(last)) last -= 1;
+    const first, const last = b.selectedLines();
     var all = true;
     var least: u32 = std.math.maxInt(u32);
     var line = first;
@@ -450,6 +454,83 @@ pub fn toggleComment(b: *Buffer) Allocator.Error!void {
     try b.replace(start, b.lineEnd(last), out.items, .other);
     b.anchor = start;
     b.cursor = start + @as(u32, @intCast(out.items.len));
+}
+
+/// The selected lines, or the caret's, written again under themselves; the
+/// selection goes with the copy.
+pub fn duplicateLines(b: *Buffer) Allocator.Error!void {
+    const first, const last = b.selectedLines();
+    const end = b.lineEnd(last);
+    var copy: std.ArrayList(u8) = .empty;
+    defer copy.deinit(b.gpa);
+    try copy.append(b.gpa, '\n');
+    try copy.appendSlice(b.gpa, b.text.items[b.lineStart(first)..end]);
+    const cursor = b.cursor;
+    const anchor = b.anchor;
+    try b.replace(end, end, copy.items, .other);
+    const added: u32 = @intCast(copy.items.len);
+    b.cursor = cursor + added;
+    b.anchor = anchor + added;
+}
+
+/// The selected lines, or the caret's, gone with their line breaks; the
+/// caret at the start of the line that comes up in their place.
+pub fn deleteLines(b: *Buffer) Allocator.Error!void {
+    const first, const last = b.selectedLines();
+    var start = b.lineStart(first);
+    var end = b.lineEnd(last);
+    if (last + 1 < b.lineCount()) {
+        end += 1;
+    } else if (first > 0) {
+        // The last line takes the break before it, not a line after it.
+        start -= 1;
+    }
+    try b.replace(start, end, "", .other);
+    b.moveTo(b.lineStart(@min(first, b.lineCount() - 1)), false);
+}
+
+/// The selected lines, or the caret's, swapped with the line above them or
+/// below, the selection going with them. Moves one after another are one
+/// step to undo.
+pub fn moveLines(b: *Buffer, up: bool) Allocator.Error!void {
+    const first, const last = b.selectedLines();
+    if (if (up) first == 0 else last + 1 >= b.lineCount()) return;
+    const other = if (up) first - 1 else last + 1;
+    const from = b.lineStart(@min(first, other));
+    const to = b.lineEnd(@max(last, other));
+    const block = b.text.items[b.lineStart(first)..b.lineEnd(last)];
+    const passed = b.lineText(other);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(b.gpa);
+    if (up) {
+        try out.appendSlice(b.gpa, block);
+        try out.append(b.gpa, '\n');
+        try out.appendSlice(b.gpa, passed);
+    } else {
+        try out.appendSlice(b.gpa, passed);
+        try out.append(b.gpa, '\n');
+        try out.appendSlice(b.gpa, block);
+    }
+    const shift: u32 = @intCast(passed.len + 1);
+    const cursor = if (up) b.cursor - shift else b.cursor + shift;
+    const anchor = if (up) b.anchor - shift else b.anchor + shift;
+    try b.replace(from, to, out.items, .moving);
+    b.cursor = cursor;
+    b.anchor = anchor;
+}
+
+/// The selection in upper case, or lower: its ASCII letters, the rest as
+/// they are. The selection stays.
+pub fn changeCase(b: *Buffer, upper: bool) Allocator.Error!void {
+    const s = b.selection() orelse return;
+    const changed = try b.gpa.dupe(u8, b.text.items[s[0]..s[1]]);
+    defer b.gpa.free(changed);
+    for (changed) |*c| c.* = if (upper) std.ascii.toUpper(c.*) else std.ascii.toLower(c.*);
+    const cursor = b.cursor;
+    const anchor = b.anchor;
+    try b.replace(s[0], s[1], changed, .other);
+    b.cursor = cursor;
+    b.anchor = anchor;
 }
 
 pub fn undo(b: *Buffer) Allocator.Error!void {
@@ -713,4 +794,35 @@ test "a file's line breaks are written back as it had them" {
     const same = try plain.written(gpa);
     defer gpa.free(same);
     try testing.expectEqualStrings("a\nb\n", same);
+}
+
+test "lines duplicated, moved and deleted, and a selection's case changed" {
+    var b: Buffer = try .init(testing.allocator, "one\ntwo\nthree", c_like);
+    defer b.deinit();
+    b.moveTo(b.lineStart(1) + 1, false);
+    try b.duplicateLines();
+    try expectText(&b, "one\ntwo\ntwo\nthree");
+    try testing.expectEqual(@as(u32, 2), b.lineOf(b.cursor));
+
+    // Moved up twice, the caret going with it: one step to undo.
+    try b.moveLines(true);
+    try b.moveLines(true);
+    try expectText(&b, "two\none\ntwo\nthree");
+    try testing.expectEqual(@as(u32, 0), b.lineOf(b.cursor));
+    try b.undo();
+    try expectText(&b, "one\ntwo\ntwo\nthree");
+
+    // The last line takes the break before it with it.
+    b.moveTo(b.len(), false);
+    try b.deleteLines();
+    try expectText(&b, "one\ntwo\ntwo");
+    b.moveTo(0, false);
+    try b.deleteLines();
+    try expectText(&b, "two\ntwo");
+
+    b.moveTo(0, false);
+    b.moveTo(3, true);
+    try b.changeCase(true);
+    try expectText(&b, "TWO\ntwo");
+    try testing.expectEqualStrings("TWO", b.selectedText());
 }
