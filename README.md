@@ -103,7 +103,7 @@ try doc.typeChar('a');
 view.pointer(&doc, &ui, .{ .x = x, .y = y, .down = down, .pressed = pressed, .mods = .{} });
 if (wheel != 0 and view.under(&ui)) doc.scroll(wheel, shift);
 doc.refresh();
-view.draw(&doc, &ui, true);
+view.draw(&doc, &ui, window_focused and view.hasKeys(&ui));
 // ...and once the frame is laid out:
 view.measure(&doc, &ui, 1);
 ```
@@ -114,6 +114,10 @@ view.measure(&doc, &ui, 1);
 if (try view.minimapPixels(&doc, gpa, &pixels)) |size| upload(texture, size, pixels.items);
 view.minimap_texture = texture_number;
 ```
+
+**The keyboard** is the code's once it is pressed, or given it with `view.focus(&ui)`, until something else takes fluxion-ui's focus: `view.hasKeys(&ui)` says whether it has it. It takes every key then, Tab too - the interface does not move the focus on from it, and fluxion-ui's `wantsKeyboard` is true - so a host hands it the keys and characters while `hasKeys`, and a field of its own, such as the find bar's, while `wantsKeyboard` and not `hasKeys`.
+
+**A completion** may put in more than its name: an item's `insert` replaces from the list's `start` - which may be before the word, the `fn` of a method being written - with the caret at its `caret`. A word typed after one of the service's `triggers` asks again however long it is, so a list closed on the way opens.
 
 `view.under(&ui)` says whether the pointer is on the view - its words, the rows and marks it lays over itself, a tooltip - rather than on the list of completions or on something else over it: where a press takes the keyboard and the wheel scrolls. The rows float, so fluxion-ui's `isPointerOver` of the view is false on them; ask `under`. A tooltip and a signature let the pointer through to the text beneath.
 

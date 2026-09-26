@@ -126,11 +126,18 @@ pub const Item = struct {
     call: Call = .none,
     /// A colour to show in place of its kind: a colour's name, offered.
     swatch: ?[4]f32 = null,
+    /// What is put in place of the word, when it is not `label`: a whole
+    /// method, header and body. It replaces from `Completions.start`.
+    insert: ?[]const u8 = null,
+    /// Where in `insert` the caret goes then.
+    caret: ?u32 = null,
 };
 
 pub const Completions = struct {
     items: []const Item,
-    /// The word at the caret, which a completion replaces.
+    /// The word at the caret, which a completion replaces - from before it,
+    /// where an item's `insert` takes in what comes before the word too:
+    /// the `fn` of a method being written.
     start: u32,
     end: u32,
 };

@@ -105,8 +105,21 @@ pub fn measure(v: View, ed: *Document, ui: *Ui, scale: f32) void {
     ed.gutter = gutterWidth(ed);
 }
 
+/// Whether the code has the keyboard: it was pressed, or given it with
+/// `focus`, and nothing has taken it since. It takes every key then, Tab
+/// too: the interface does not move on from it.
+pub fn hasKeys(v: View, ui: *Ui) bool {
+    return ui.isFocused(v.ids.code);
+}
+
+/// Gives the code the keyboard.
+pub fn focus(v: View, ui: *Ui) void {
+    ui.setFocus(v.ids.code);
+}
+
 /// The code view, and the find bar over it while it is open. `focused` is
-/// whether the code has the keyboard, which is when the caret shows.
+/// whether the code has the keyboard, which is when the caret shows: its
+/// window's and `hasKeys`.
 pub fn draw(v: View, ed: *Document, ui: *Ui, focused: bool) void {
     ed.follow();
     ui.open(.{ .width = .grow, .height = .grow, .direction = .top_to_bottom });
@@ -120,6 +133,7 @@ pub fn draw(v: View, ed: *Document, ui: *Ui, focused: bool) void {
         .background_color = v.theme.code,
         .clip = .both,
         .cursor = .ibeam,
+        .focus = .{ .keys = .all, .tab_stop = false },
     });
     defer ui.close();
     ed.gutter = gutterWidth(ed);
@@ -885,6 +899,7 @@ pub fn pointer(v: View, ed: *Document, ui: *Ui, p: Pointer) void {
         return;
     }
     if (p.pressed) {
+        v.focus(ui);
         // A colour's swatch opens its picker, and leaves the caret.
         if (swatchUnder(ed, p.x - x0, p.y - y0)) |start| {
             ed.pickColor(start);
@@ -980,6 +995,29 @@ test "a line's indentation is drawn as part of its text, and the caret where the
     // third line; and the view found by the name it was given.
     try testing.expectEqual(gutter + 8 * 8, xOf(&ed, ed.buffer.cursor));
     try testing.expectEqual(@as(f32, 800), ed.view[2]);
+}
+
+test "a press gives the code the keyboard, every key of it: Tab does not move the focus on" {
+    const gpa = testing.allocator;
+    var ed: Document = try .init(gpa, "t.txt", "hello\n", languages.plain, .{ .font_size = 16, .line_height = 16 });
+    defer ed.deinit();
+    ed.refresh();
+    var ui: Ui = .init(gpa);
+    defer ui.deinit();
+    ui.setMeasurer(.monospace(0.5, 1.0));
+    var ruler: Ruler = .{};
+    const view: View = .{};
+    _ = try frame(view, &ed, &ui, &ruler);
+    _ = try frame(view, &ed, &ui, &ruler);
+    try testing.expect(!view.hasKeys(&ui));
+    const x = gutterWidth(&ed) + 8;
+    ui.setPointer(x, 8, true);
+    view.pointer(&ed, &ui, .{ .x = x, .y = 8, .down = true, .pressed = true, .mods = .{} });
+    _ = try frame(view, &ed, &ui, &ruler);
+    try testing.expect(view.hasKeys(&ui));
+    try testing.expect(ui.wantsKeyboard());
+    try testing.expect(!ui.navigate(.next));
+    try testing.expect(view.hasKeys(&ui));
 }
 
 test "a tab is drawn as room to the next stop" {

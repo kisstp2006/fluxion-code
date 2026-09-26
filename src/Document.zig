@@ -508,7 +508,10 @@ pub fn filter(ed: *Document) void {
     const c = &ed.completion;
     if (!c.open) return;
     if (ed.buffer.cursor < c.start or ed.buffer.selection() != null) return ed.closeCompletion();
-    const typed = ed.buffer.text.items[c.start..ed.buffer.cursor];
+    // What the completion replaces may start before the word - a method's
+    // `fn` - and the word is what is matched.
+    const from = if (c.path) c.start else @max(c.start, ed.buffer.wordStart(ed.buffer.cursor));
+    const typed = ed.buffer.text.items[from..ed.buffer.cursor];
     for (typed) |ch| if (!Buffer.isWordChar(ch) and !(c.path and inName(ch))) return ed.closeCompletion();
     c.shown.clearRetainingCapacity();
     for (c.items, 0..) |item, i| {
@@ -580,6 +583,12 @@ pub fn accept(ed: *Document, index: usize) Allocator.Error!void {
         return;
     }
     const end = b.wordEnd(b.cursor);
+    if (item.insert) |text| {
+        try b.replace(c.start, end, text, .other);
+        if (item.caret) |caret| b.moveTo(c.start + caret, false);
+        ed.closeCompletion();
+        return;
+    }
     const next: u8 = if (end < b.len()) b.text.items[end] else 0;
     if (item.call != .none and next != '(') {
         const text = try std.fmt.allocPrint(ed.gpa, "{s}()", .{item.label});
@@ -800,9 +809,13 @@ pub fn typeChar(ed: *Document, codepoint: u21) Allocator.Error!void {
     }
     const service = ed.language.service;
     if (Buffer.isWordChar(c)) {
+        const start = ed.buffer.wordStart(ed.buffer.cursor);
+        // A word's first letter asks, as does any after one of the
+        // service's triggers, the list having been closed on the way.
+        const after_trigger = start > 0 and std.mem.indexOfScalar(u8, service.triggers, ed.buffer.text.items[start - 1]) != null;
         if (ed.completion.open) {
             ed.filter();
-        } else if (!std.ascii.isDigit(c) and ed.buffer.cursor - ed.buffer.wordStart(ed.buffer.cursor) == 1) {
+        } else if (!std.ascii.isDigit(c) and (ed.buffer.cursor - start == 1 or after_trigger)) {
             ed.complete();
         }
     } else if (c != 0 and std.mem.indexOfScalar(u8, service.triggers, c) != null) {
@@ -1064,6 +1077,17 @@ const Toy = struct {
 
     fn toyComplete(_: ?*anyopaque, _: Allocator, arena: Allocator, _: []const u8, text: []const u8, offset: u32) language_zig.Error!?language_zig.Completions {
         var items: std.ArrayList(Item) = .empty;
+        var word = offset;
+        while (word > 0 and Buffer.isWordChar(text[word - 1])) word -= 1;
+        // After `fn `, a whole function; after a `@`, what may follow it.
+        if (word >= 3 and std.mem.eql(u8, text[word - 3 .. word], "fn ")) {
+            try items.append(arena, .{ .label = "go", .kind = .method, .insert = "fn go() {\n    \n}", .caret = 14 });
+            return .{ .items = items.items, .start = word - 3, .end = offset };
+        }
+        if (word >= 1 and text[word - 1] == '@') {
+            try items.append(arena, .{ .label = "export", .kind = .keyword });
+            return .{ .items = items.items, .start = word, .end = offset };
+        }
         var at: usize = 0;
         while (std.mem.indexOfPos(u8, text, at, "let ")) |i| : (at = i + 4) {
             const end = wordEndIn(text, i + 4);
@@ -1100,11 +1124,31 @@ const Toy = struct {
         .line_comment = "//",
         .pairs = &.{.{ '(', ')' }},
         .lexis = .{ .keywords = &.{"let"} },
-        .service = .{ .analyze = toyAnalyze, .forget = toyForget, .complete = toyComplete, .signature = toySignature, .definition = toyDefinition },
+        .service = .{ .analyze = toyAnalyze, .forget = toyForget, .complete = toyComplete, .signature = toySignature, .definition = toyDefinition, .triggers = "@" },
     };
 };
 
 const test_metrics: Metrics = .{ .font_size = 16, .line_height = 18 };
+
+test "a completion may put in more than its name: a whole function, from its `fn`, the caret in its body" {
+    var ed: Document = try .init(testing.allocator, "t.toy", "", Toy.lang, test_metrics);
+    defer ed.deinit();
+    for ("fn g") |c| try ed.typeChar(c);
+    try testing.expect(ed.completion.open);
+    try testing.expectEqualStrings("go", ed.selectedItem().?.label);
+    try ed.accept(ed.completion.selected);
+    try testing.expectEqualStrings("fn go() {\n    \n}", ed.buffer.text.items);
+    try testing.expectEqual(@as(u32, 14), ed.buffer.cursor);
+}
+
+test "after a trigger, a word asks again however long it is: a list closed on the way opens" {
+    var ed: Document = try .init(testing.allocator, "t.toy", "", Toy.lang, test_metrics);
+    defer ed.deinit();
+    try ed.buffer.insert("@e");
+    try ed.typeChar('x');
+    try testing.expect(ed.completion.open);
+    try testing.expectEqualStrings("export", ed.selectedItem().?.label);
+}
 
 test "completions narrow as the word is typed, and a function comes with its parentheses and signature" {
     var ed: Document = try .init(testing.allocator, "t.toy", "let rounds\nlet robin\n", Toy.lang, test_metrics);
