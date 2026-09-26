@@ -124,7 +124,12 @@ pub fn draw(v: View, ed: *Document, ui: *Ui, focused: bool) void {
     ed.follow();
     ui.open(.{ .width = .grow, .height = .grow, .direction = .top_to_bottom });
     defer ui.close();
-    if (ed.find.open) v.findBar(ed, ui);
+    if (ed.find.open) {
+        v.findBar(ed, ui);
+    } else if (v.findHadKeys(ui)) {
+        // The bar closed while a field of it was typed in: the code is.
+        v.focus(ui);
+    }
     ui.open(.{
         .id = v.ids.code,
         .width = .grow,
@@ -708,6 +713,15 @@ fn part(v: View, buffer: []u8, name: []const u8) []const u8 {
     return std.fmt.bufPrint(buffer, "{s}-{s}", .{ v.ids.find, name }) catch v.ids.find;
 }
 
+/// Whether a field of the find bar has the keyboard.
+fn findHadKeys(v: View, ui: *Ui) bool {
+    var name: [64]u8 = undefined;
+    for ([_][]const u8{ "query", "replacement", "line" }) |part_name| {
+        if (ui.isFocused(v.part(&name, part_name))) return true;
+    }
+    return false;
+}
+
 /// The find bar: the words to find, what they become, or the line to go to,
 /// with its buttons. Its fields have the keyboard while they are typed in.
 fn findBar(v: View, ed: *Document, ui: *Ui) void {
@@ -1133,6 +1147,11 @@ test "the find bar goes over the code, and the places it finds are lit" {
         lit += 1;
     };
     try testing.expectEqual(@as(usize, 2), lit);
+
+    // Closed, it hands the keyboard back to the code.
+    try testing.expect(ed.cancel());
+    _ = try frame(view, &ed, &ui, &ruler);
+    try testing.expect(view.hasKeys(&ui));
 }
 
 test "a colour's swatch is before it, a press on it opens the picker, and the picker's buttons write it in another form" {
