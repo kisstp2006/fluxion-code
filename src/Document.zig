@@ -608,9 +608,12 @@ pub fn accept(ed: *Document, index: usize) Allocator.Error!void {
         return;
     }
     const end = b.wordEnd(b.cursor);
+    const start = c.start;
+    // What the item puts before the word moves the word along.
+    const moved: u32 = if (item.also) |also| @intCast(also.text.len) else 0;
     if (item.insert) |text| {
-        try b.replace(c.start, end, text, .other);
-        if (item.caret) |caret| b.moveTo(c.start + caret, false);
+        try ed.put(start, end, text, item.also);
+        if (item.caret) |caret| b.moveTo(start + moved + caret, false);
         ed.closeCompletion();
         return;
     }
@@ -618,7 +621,7 @@ pub fn accept(ed: *Document, index: usize) Allocator.Error!void {
     if (item.call != .none and next != '(') {
         const text = try std.fmt.allocPrint(ed.gpa, "{s}()", .{item.label});
         defer ed.gpa.free(text);
-        try b.replace(c.start, end, text, .other);
+        try ed.put(start, end, text, item.also);
         ed.closeCompletion();
         if (item.call == .arguments) {
             b.moveTo(b.cursor - 1, false);
@@ -626,8 +629,20 @@ pub fn accept(ed: *Document, index: usize) Allocator.Error!void {
         }
         return;
     }
-    try b.replace(c.start, end, item.label, .other);
+    try ed.put(start, end, item.label, item.also);
     ed.closeCompletion();
+}
+
+/// `text` in place of `start..end`, and `also` before it, as one step to
+/// undo: all from where `also` goes to the word's end is written anew. The
+/// caret after `text`.
+fn put(ed: *Document, start: u32, end: u32, text: []const u8, also: ?Item.Also) Allocator.Error!void {
+    const b = &ed.buffer;
+    const before = also orelse return b.replace(start, end, text, .other);
+    const at = @min(before.at, start);
+    const whole = try std.mem.concat(ed.gpa, u8, &.{ before.text, b.text.items[at..start], text });
+    defer ed.gpa.free(whole);
+    try b.replace(at, end, whole, .other);
 }
 
 // ---------------------------------------------------------------------------
@@ -1249,6 +1264,10 @@ const Toy = struct {
             try items.append(arena, .{ .label = text[i + 4 .. end], .kind = .variable });
         }
         try items.append(arena, .{ .label = "fight", .kind = .function, .call = .arguments, .rank = 1 });
+        // A name another file has, with its file taken in at the top.
+        if (std.mem.indexOf(u8, text, "use other\n") == null) {
+            try items.append(arena, .{ .label = "shout", .kind = .function, .insert = "other.shout", .also = .{ .at = 0, .text = "use other\n" }, .rank = 2 });
+        }
         var start = offset;
         while (start > 0 and Buffer.isWordChar(text[start - 1])) start -= 1;
         return .{ .items = items.items, .start = start, .end = offset };
@@ -1294,6 +1313,19 @@ test "a completion may put in more than its name: a whole function, from its `fn
     try ed.accept(ed.completion.selected);
     try testing.expectEqualStrings("fn go() {\n    \n}", ed.buffer.text.items);
     try testing.expectEqual(@as(u32, 14), ed.buffer.cursor);
+}
+
+test "a completion from another file brings its import in with it, as one step to undo" {
+    var ed: Document = try .init(testing.allocator, "t.toy", "let x\n", Toy.lang, test_metrics);
+    defer ed.deinit();
+    ed.buffer.moveTo(ed.buffer.len(), false);
+    for ("sho") |c| try ed.typeChar(c);
+    try testing.expectEqualStrings("shout", ed.selectedItem().?.label);
+    try ed.accept(ed.completion.selected);
+    try testing.expectEqualStrings("use other\nlet x\nother.shout", ed.buffer.text.items);
+    try testing.expectEqual(ed.buffer.len(), ed.buffer.cursor);
+    try ed.buffer.undo();
+    try testing.expectEqualStrings("let x\nsho", ed.buffer.text.items);
 }
 
 test "after a trigger, a word asks again however long it is: a list closed on the way opens" {

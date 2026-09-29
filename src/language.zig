@@ -131,6 +131,15 @@ pub const Item = struct {
     insert: ?[]const u8 = null,
     /// Where in `insert` the caret goes then.
     caret: ?u32 = null,
+    /// Text put in before the word too, in the same step: an import of the
+    /// file the item is from, at the top of this one.
+    also: ?Also = null,
+
+    pub const Also = struct {
+        /// Where it goes: at or before `Completions.start`.
+        at: u32,
+        text: []const u8,
+    };
 };
 
 pub const Completions = struct {
