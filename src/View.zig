@@ -378,7 +378,7 @@ fn minimap(v: View, ed: *Document, ui: *Ui) void {
         .width = .fixed(w),
         .height = .fixed(shown),
         .image = .{ .texture = texture, .source = .init(0, offset / tall, 1, shown / tall) },
-        .floating = .{ .offset = .{ .x = x, .y = 0 }, .z_index = 7, .clip = true },
+        .floating = .{ .offset = .{ .x = x, .y = 0 }, .z_index = 7, .clip = .target },
     });
     const lines: f32 = @floatFromInt(ed.buffer.lineCount());
     const top: f32 = @floatFromInt(ed.top);
@@ -468,7 +468,7 @@ fn row(v: View, ed: *Document, ui: *Ui, line: u32) void {
     ui.open(.{
         .height = .fixed(m.line_height),
         .direction = .left_to_right,
-        .floating = .{ .offset = .{ .x = ed.gutter - ed.left, .y = yOf(ed, line) }, .z_index = 1, .clip = true },
+        .floating = .{ .offset = .{ .x = ed.gutter - ed.left, .y = yOf(ed, line) }, .z_index = 1, .clip = .target },
     });
     defer ui.close();
     const start = b.lineStart(line);
@@ -542,7 +542,7 @@ fn gutterColumn(v: View, ed: *Document, ui: *Ui) void {
             .width = .fixed(ed.gutter - 1.5 * em(ed)),
             .height = .fixed(ed.metrics.line_height),
             .align_x = .right,
-            .floating = .{ .offset = .{ .x = 0, .y = yOf(ed, line) }, .z_index = 5, .clip = true },
+            .floating = .{ .offset = .{ .x = 0, .y = yOf(ed, line) }, .z_index = 5, .clip = .target },
         });
         ui.text(std.fmt.bufPrint(&digits, "{d}", .{line + 1}) catch "?", v.style(ed, color));
         ui.close();
@@ -555,7 +555,7 @@ fn rect(ui: *Ui, x: f32, y: f32, w: f32, h: f32, color: Color, z: i16) void {
         .width = .fixed(@max(w, 1)),
         .height = .fixed(h),
         .background_color = color,
-        .floating = .{ .offset = .{ .x = x, .y = y }, .z_index = z, .clip = true },
+        .floating = .{ .offset = .{ .x = x, .y = y }, .z_index = z, .clip = .target },
     });
 }
 

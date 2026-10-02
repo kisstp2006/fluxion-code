@@ -9,8 +9,8 @@
     // copy of each.
     .dependencies = .{
         .fluxion_ui = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-ui#ac88e9820b942947e4eb4d0f6a377b008a0b3d70",
-            .hash = "fluxion_ui-0.1.0-lw4Ws_VQEAClHzg2bRTJ94nRWt-0chfUczMcTkatYsci",
+            .url = "git+https://github.com/kisstp2006/fluxion-ui#d57e5e3e90f3750fa442376ff37800c556cb66cb",
+            .hash = "fluxion_ui-0.1.0-lw4Ws1xsEADjTQAoU4DyCeTJwBy3PqwfMZLXqQONMQ2e",
         },
         .fluxion_text = .{
             .url = "git+https://github.com/kisstp2006/fluxion-text#41010ffb170fb13a72cc1751ee6031f8d1eebb6f",
